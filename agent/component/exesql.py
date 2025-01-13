@@ -19,7 +19,6 @@ import pandas as pd
 import pymysql
 import psycopg2
 from agent.component import GenerateParam, Generate
-import pyodbc
 import logging
 
 class ExeSQLParam(GenerateParam):
@@ -83,14 +82,7 @@ class ExeSQL(Generate, ABC):
             db = psycopg2.connect(dbname=self._param.database, user=self._param.username, host=self._param.host,
                                   port=self._param.port, password=self._param.password)
         elif self._param.db_type == 'mssql':
-            conn_str = (
-                r'DRIVER={ODBC Driver 17 for SQL Server};'
-                r'SERVER=' + self._param.host + ',' + str(self._param.port) + ';'
-                r'DATABASE=' + self._param.database + ';'
-                r'UID=' + self._param.username + ';'
-                r'PWD=' + self._param.password
-            )
-            db = pyodbc.connect(conn_str)
+            raise NotImplementedError("MSSQL support is disabled")
         try:
             cursor = db.cursor()
         except Exception as e:
