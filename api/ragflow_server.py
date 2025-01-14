@@ -41,6 +41,7 @@ from api.db.init_data import init_web_data
 from api.versions import get_ragflow_version
 from api.utils import show_configs
 from rag.settings import print_rag_settings
+from flask import jsonify
 
 
 def update_progress():
@@ -50,6 +51,14 @@ def update_progress():
             DocumentService.update_progress()
         except Exception:
             logging.exception("update_progress exception")
+
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': time.time()
+    }), 200
 
 
 if __name__ == '__main__':
