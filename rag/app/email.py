@@ -60,13 +60,21 @@ def chunk(
     #  get the email main info
     def _add_content(msg, content_type):
         if content_type == "text/plain":
-            text_txt.append(
-                msg.get_payload(decode=True).decode(msg.get_content_charset())
-            )
+            try:
+                charset = msg.get_content_charset() or 'utf-8'
+                payload = msg.get_payload(decode=True)
+                text = payload.decode(charset, errors='replace')
+                text_txt.append(text)
+            except Exception as e:
+                logging.warning(f"Failed to decode text content: {e}")
         elif content_type == "text/html":
-            html_txt.append(
-                msg.get_payload(decode=True).decode(msg.get_content_charset())
-            )
+            try:
+                charset = msg.get_content_charset() or 'utf-8'
+                payload = msg.get_payload(decode=True)
+                text = payload.decode(charset, errors='replace')
+                html_txt.append(text)
+            except Exception as e:
+                logging.warning(f"Failed to decode html content: {e}")
         elif "multipart" in content_type:
             if msg.is_multipart():
                 for part in msg.iter_parts():
@@ -81,8 +89,8 @@ def chunk(
     st = timer()
     chunks = naive_merge(
         sections,
-        int(parser_config.get("chunk_token_num", 128)),
-        parser_config.get("delimiter", "\n!?。；！？"),
+        int(parser_config.get("chunk_token_num", 256)),
+        parser_config.get("delimiter", "\n!?。；！？.,:，：』」"),
     )
 
     main_res.extend(tokenize_chunks(chunks, doc, eng, None))

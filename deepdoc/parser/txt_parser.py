@@ -17,12 +17,12 @@ from rag.nlp import num_tokens_from_string
 
 
 class RAGFlowTxtParser:
-    def __call__(self, fnm, binary=None, chunk_token_num=128, delimiter="\n!?;。；！？"):
+    def __call__(self, fnm, binary=None, chunk_token_num=256, delimiter="\n!?;。；！？.,:，：』」)\n"):
         txt = get_text(fnm, binary)
         return self.parser_txt(txt, chunk_token_num, delimiter)
 
     @classmethod
-    def parser_txt(cls, txt, chunk_token_num=128, delimiter="\n!?;。；！？"):
+    def parser_txt(cls, txt, chunk_token_num=256, delimiter="\n!?;。；！？.,:，：』」"):
         if not isinstance(txt, str):
             raise TypeError("txt type should be str!")
         cks = [""]
