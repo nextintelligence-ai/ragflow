@@ -17,7 +17,6 @@ import json
 import signal
 import atexit
 import fcntl
-import requests
 import threading
 
 # .env 파일 로드
@@ -37,6 +36,7 @@ class Timer:
         self.end = time.time()
         self.duration = self.end - self.start
         self.logger.info(f"{self.description} 완료: {self.duration:.2f}초 소요")
+
 
 def setup_logging(debug=False):
     """로깅 설정"""
@@ -561,7 +561,7 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
                                 logger.warning(f"첨부파일 크기 계산 실패: {str(e)}")
                     except Exception as e:
                         logger.warning(f"첨부파일 정보 처리 중 오류 발생: {str(e)}")
-                        continue
+                    continue
             
             # 이메일 날짜 추출
             date_str = 'unknown_date'
@@ -575,14 +575,15 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
             
             # 제목 처리
             raw_subject = email_message.get('Subject', 'no_subject')
+            safe_subject = 'no_subject'
             try:
                 subject = decode_header(raw_subject)
-                safe_subject = "".join(x for x in subject if x.isalnum() or x in (' ', '-', '_'))[:50]
-                if not safe_subject:
-                    safe_subject = 'no_subject'
+                if subject:
+                    safe_subject = "".join(x for x in subject if x.isalnum() or x in (' ', '-', '_'))[:50]
+                    if not safe_subject.strip():
+                        safe_subject = 'no_subject'
             except Exception as e:
                 logger.error(f"제목 처리 실패: {str(e)}")
-                safe_subject = 'no_subject'
             
             # 파일 경로 설정
             filename = f"{date_str}_{safe_subject}_uid{uid}.eml"
@@ -647,7 +648,7 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
                                 save_success = True
                                 break
                         
-                        logger.warning(f"파일 크기 불일치 (시도 {attempt + 1}): 예상={email_size}, 실제={saved_size if 'saved_size' in locals() else 'unknown'})")
+                        logger.warning(f"파일 크기 불일치 (시도 {attempt + 1}): 예상={email_size}, 실제={saved_size}")
                         if attempt < 2:
                             await asyncio.sleep(0.1)
                             continue
@@ -726,6 +727,16 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
             try:
                 # 이메일 검색 조건 설정
                 if last_sync_time:
+                    # 이미 존재하는 EML 파일 확인
+                    existing_files = set()
+                    folder_dir = os.path.join(output_dir, folder_path.replace('"', '').replace('/', os.path.sep))
+                    if os.path.exists(folder_dir):
+                        for file in os.listdir(folder_dir):
+                            if file.endswith('.eml'):
+                                uid_match = re.search(r'_uid(\d+)\.eml$', file)
+                                if uid_match:
+                                    existing_files.add(int(uid_match.group(1)))
+                    
                     # RFC3501 날짜 형식으로 변환 (DD-Mon-YYYY)
                     search_date = last_sync_time.strftime("%d-%b-%Y")
                     search_cmd = f'(SINCE {search_date})'
@@ -738,6 +749,12 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                         filtered_uids = []
                         
                         for uid in message_uids:
+                            uid_int = int(uid.decode())
+                            # 이미 처리된 UID이거나 EML 파일이 존재하는 경우 건너뜀
+                            if uid_int <= checkpoint["last_uid"] or uid_int in existing_files:
+                                logger.debug(f"이미 처리된 UID 제외: {uid_int}")
+                                continue
+                            
                             try:
                                 # 메시지 헤더만 가져오기
                                 _, msg_data = imap.uid('fetch', uid, '(BODY[HEADER.FIELDS (DATE)])')
@@ -757,19 +774,29 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                                 # 동기화 시작 시간 이후의 메시지만 포함
                                                 if email_date >= last_sync_time:
                                                     filtered_uids.append(uid)
+                                                    logger.debug(f"새로운 메일 발견 - UID: {uid_int}, 날짜: {email_date}")
                                                 else:
-                                                    logger.debug(f"시간 필터링으로 제외된 메시지 - UID: {uid.decode()}, 날짜: {email_date}")
+                                                    logger.debug(f"시간 필터링으로 제외된 메시지 - UID: {uid_int}, 날짜: {email_date}")
                                         except Exception as e:
-                                            logger.warning(f"이메일 날짜 파싱 실패 (UID: {uid.decode()}): {str(e)}")
-                                            # 날짜 파싱 실패 시 포함 (놓치지 않기 위해)
-                                            filtered_uids.append(uid)
+                                            logger.warning(f"이메일 날짜 파싱 실패 (UID: {uid_int}): {str(e)}")
                             except Exception as e:
-                                logger.warning(f"메시지 헤더 조회 실패 (UID: {uid.decode()}): {str(e)}")
-                                # 오류 발생 시 포함 (놓치지 않기 위해)
-                                filtered_uids.append(uid)
+                                logger.warning(f"메시지 헤더 조회 실패 (UID: {uid_int}): {str(e)}")
                         
                         message_uids = filtered_uids
-                        logger.info(f"시간 필터링 후 처리할 이메일: {len(message_uids)}통 (전체 검색 결과: {len(message_data[0].split())}통)")
+                        new_message_count = len(message_uids)
+                        logger.info(f"새로운 메일 발견: {new_message_count}통 (전체 검색 결과: {len(message_data[0].split())}통)")
+                        
+                        if new_message_count > 0:
+                            # total_count는 기존 값 유지하고 새로운 메일 수를 더함
+                            total_count = checkpoint["total_count"] + new_message_count
+                            processed_count = 0
+                        else:
+                            logger.info(f"처리할 새 이메일 없음: {folder_path}")
+                            checkpoint_manager.update_folder_sync_time(folder_path)
+                            checkpoint_manager.mark_folder_complete(folder_path)
+                            process_folder.stats = stats
+                            process_folder.message_count = 0
+                            return
                 else:
                     status, message_data = imap.uid('search', None, 'ALL')
                 
@@ -781,7 +808,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                 
                 if not message_data[0]:
                     logger.info(f"처리할 새 이메일 없음: {folder_path}")
-                    checkpoint_manager.update_folder_sync_time(folder_path)  # 동기화 시간 업데이트
+                    checkpoint_manager.update_folder_sync_time(folder_path)
                     checkpoint_manager.mark_folder_complete(folder_path)
                     process_folder.stats = stats
                     process_folder.message_count = 0
@@ -797,9 +824,12 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                 # 새로운 동기화인 경우 processed_count는 0부터 시작
                 if last_sync_time:
                     processed_count = 0
+                    # total_count는 기존 값 유지하고 새로운 메일 수를 더함
+                    total_count = checkpoint["total_count"] + message_count
                 else:
-                    # 초기 동기화 중인 경우 기존 processed_count 유지
+                    # 초기 동기화 중인 경우
                     processed_count = checkpoint["processed_count"]
+                    total_count = message_count
                 
                 if last_uid and not last_sync_time:  # 초기 동기화 중일 때만 UID 기반 필터링
                     try:
@@ -830,7 +860,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                             folder_path,
                                             int(uid_str),
                                             processed_count,
-                                            message_count,
+                                            total_count,
                                             skipped_uid=int(uid_str)
                                         )
                                     elif result == "failed":
@@ -838,7 +868,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                             folder_path,
                                             int(uid_str),
                                             processed_count,
-                                            message_count,
+                                            total_count,
                                             failed_uid=int(uid_str)
                                         )
                                 except Exception as e:
@@ -847,7 +877,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                         folder_path,
                                         int(uid_str),
                                         processed_count,
-                                        message_count,
+                                        total_count,
                                         failed_uid=int(uid_str)
                                     )
                             
@@ -856,7 +886,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                 folder_path,
                                 int(tasks[-1][0]),  # 마지막 UID
                                 processed_count,
-                                message_count
+                                total_count
                             )
                             logger.debug(f"체크포인트 업데이트 완료 - 폴더: {folder_path}, UID: {tasks[-1][0]}")
                         except Exception as e:
@@ -866,8 +896,8 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                         failed_uids = checkpoint_manager.get_failed_uids(folder_path)
                         skipped_uids = checkpoint_manager.get_skipped_uids(folder_path)
                         logger.info(
-                            f"진행 상황 (폴더: {folder_path}): {processed_count}/{message_count} "
-                            f"({(processed_count/message_count)*100:.1f}%) - "
+                            f"진행 상황 (폴더: {folder_path}): {processed_count}/{total_count} "
+                            f"({(processed_count/total_count)*100:.1f}%) - "
                             f"처리 속도: {folder_stats['speed']:.1f}통/초\n"
                             f"실패한 UID 수: {len(failed_uids)}, 건너뛴 UID 수: {len(skipped_uids)}"
                         )
@@ -884,7 +914,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                         folder_path,
                                         int(uid_str),
                                         processed_count,
-                                        message_count,
+                                        total_count,
                                         skipped_uid=int(uid_str)
                                     )
                                 elif result == "failed":
@@ -892,7 +922,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                         folder_path,
                                         int(uid_str),
                                         processed_count,
-                                        message_count,
+                                        total_count,
                                         failed_uid=int(uid_str)
                                     )
                             except Exception as e:
@@ -901,7 +931,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                     folder_path,
                                     int(uid_str),
                                     processed_count,
-                                    message_count,
+                                    total_count,
                                     failed_uid=int(uid_str)
                                 )
                         
@@ -912,7 +942,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                 folder_path,
                                 last_uid,
                                 processed_count,
-                                message_count
+                                total_count
                             )
                     except Exception as e:
                         logger.error(f"일부 이메일 처리 실패: {str(e)}")
@@ -926,10 +956,27 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                 failed_uids = checkpoint_manager.get_failed_uids(folder_path)
                 skipped_uids = checkpoint_manager.get_skipped_uids(folder_path)
                 success_rate = (final_stats['email_count'] / final_stats['processed_count'] * 100) if final_stats['processed_count'] > 0 else 0
+                
+                # 동기화 히스토리 출력
+                sync_history = checkpoint_manager.get_folder_sync_history(folder_path)
+                if sync_history:
+                    logger.info("\n=== 동기화 히스토리 ===")
+                    for idx, history in enumerate(sync_history, 1):
+                        logger.info(
+                            f"동기화 #{idx} ({history['timestamp']})\n"
+                            f"- 이전 총 메일 수: {history['previous_total']}통\n"
+                            f"- 새로운 메일 수: {history['new_messages']}통\n"
+                            f"- 처리된 메일 수: {history['processed_count']}통\n"
+                            f"- 마지막 UID: {history['last_uid']}\n"
+                            f"- 실패한 UID 수: {len(history['failed_uids'])}\n"
+                            f"- 건너뛴 UID 수: {len(history['skipped_uids'])}\n"
+                        )
+                
                 logger.info(
+                    f"\n=== 현재 동기화 결과 ===\n"
                     f"폴더 처리 완료: {folder_path}\n"
-                    f"- 총 이메일: {message_count}통\n"
-                    f"- 성공: {message_count - final_stats['failed_count'] - final_stats['skipped_count']}통\n"
+                    f"- 총 이메일: {total_count}통\n"
+                    f"- 성공: {total_count - final_stats['failed_count'] - final_stats['skipped_count']}통\n"
                     f"- 실패: {final_stats['failed_count']}통 (성공률: {success_rate:.1f}%)\n"
                     f"- 건너뜀: {final_stats['skipped_count']}통\n"
                     f"- 총 용량: {final_stats['total_size']}\n"
@@ -952,7 +999,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
             logger.error(f"폴더 처리 실패: {folder_path}, 오류: {str(e)}")
             process_folder.stats = stats
             process_folder.message_count = 0
-            
+
 async def process_email(num, imap, output_dir, folder_path, stats, use_uid=False):
     """단일 이메일 처리 (비동기)"""
     logger = logging.getLogger(__name__)
@@ -1015,12 +1062,10 @@ async def process_email(num, imap, output_dir, folder_path, stats, use_uid=False
                 except Exception as reconnect_error:
                     logger.error(f"재연결 실패: {str(reconnect_error)}")
             
-            if retry_count >= max_retries - 1:
-                stats.add_failure()
-                logger.error(f"이메일 처리 실패 (최대 재시도 횟수 초과) - 폴더: {folder_path}, {'UID' if use_uid else '번호'}: {num}, 오류: {error_str}")
-                return "failed"
-            
-            retry_count += 1
+            stats.add_failure()
+            logger.error(f"이메일 처리 실패 (최대 재시도 횟수 초과) - 폴더: {folder_path}, {'UID' if use_uid else '번호'}: {num}, 오류: {error_str}")
+        
+        retry_count += 1
     
     return "failed"
 
@@ -1086,7 +1131,6 @@ class CheckpointManager:
         self._lock_file = None
         self._remove_stale_lock()  # 오래된 락 파일 제거
         self.checkpoint_data = self._load_checkpoint()
-        
         # 메인 스레드에서만 signal 핸들러 등록
         if threading.current_thread() is threading.main_thread():
             self._register_handlers()
@@ -1149,7 +1193,7 @@ class CheckpointManager:
             if self.account not in data:
                 data[self.account] = {
                     "last_update": datetime.now().isoformat(),
-                    "sync_start_time": datetime.now().isoformat(),  # 동기화 시작 시간 추가
+                    "sync_start_time": datetime.now().isoformat(),
                     "folders": {}
                 }
             
@@ -1159,8 +1203,10 @@ class CheckpointManager:
                     folder["failed_uids"] = []
                 if "skipped_uids" not in folder:
                     folder["skipped_uids"] = []
-                if "last_sync_time" not in folder:  # 폴더별 마지막 동기화 시간 추가
+                if "last_sync_time" not in folder:
                     folder["last_sync_time"] = data[self.account].get("sync_start_time", datetime.now().isoformat())
+                if "sync_history" not in folder:
+                    folder["sync_history"] = []
             
             return data
             
@@ -1210,7 +1256,7 @@ class CheckpointManager:
             self._release_lock()
     
     def _register_handlers(self):
-        """시그널 핸들러 등록 (메인 스레드에서만 호출)"""
+        """시그널 핸들러 등록"""
         def save_handler(signum, frame):
             self._save_checkpoint()
             if signum != 0:  # 0은 정상 종료
@@ -1218,33 +1264,18 @@ class CheckpointManager:
         
         # 정상 종료 시
         atexit.register(lambda: save_handler(0, None))
-        # 비정상 종료 시 (메인 스레드에서만)
+        # 비정상 종료 시
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT, save_handler)
             signal.signal(signal.SIGTERM, save_handler)
     
     def _normalize_folder_path(self, folder_path):
         """폴더 경로 정규화"""
-        logger = logging.getLogger(__name__)
-        logger.debug(f"정규화 전 폴더 경로: {folder_path}")
-        
-        try:
-            # 따옴표 제거
-            path = folder_path.strip('"')
-            # 경로 구분자 통일 (OS 구분자를 IMAP 구분자로 변환)
-            path = path.replace(os.path.sep, '/')
-            # 중복 슬래시 제거
-            while '//' in path:
-                path = path.replace('//', '/')
-            # 시작과 끝의 슬래시 제거
-            path = path.strip('/')
-            
-            logger.debug(f"정규화 후 폴더 경로: {path}")
-            return path
-            
-        except Exception as e:
-            logger.error(f"폴더 경로 정규화 실패: {folder_path}, 오류: {str(e)}")
-            return folder_path
+        # 따옴표 제거
+        path = folder_path.strip('"')
+        # 경로 구분자 통일
+        path = path.replace(os.path.sep, '/')
+        return path
     
     def get_folder_checkpoint(self, folder_path):
         """폴더의 체크포인트 정보 조회"""
@@ -1252,21 +1283,15 @@ class CheckpointManager:
         logger = logging.getLogger(__name__)
         logger.debug(f"체크포인트 조회 - 계정: {self.account}, 원본 경로: {folder_path}, 정규화된 경로: {normalized_path}")
         
-        # 폴더 정보가 없으면 초기화
-        if normalized_path not in self.checkpoint_data[self.account]["folders"]:
-            self.checkpoint_data[self.account]["folders"][normalized_path] = {
-                "last_uid": 0,
-                "processed_count": 0,
-                "total_count": 0,
-                "status": "not_started",
-                "failed_uids": [],
-                "skipped_uids": [],
-                "last_sync_time": self.checkpoint_data[self.account]["sync_start_time"]
-            }
-            # 새로운 폴더 추가 시 체크포인트 저장
-            self._save_checkpoint()
-        
-        checkpoint = self.checkpoint_data[self.account]["folders"].get(normalized_path)
+        checkpoint = self.checkpoint_data[self.account]["folders"].get(normalized_path, {
+            "last_uid": 0,
+            "processed_count": 0,
+            "total_count": 0,
+            "status": "not_started",
+            "failed_uids": [],  # 실패한 UID 목록
+            "skipped_uids": [],  # 건너뛴 UID 목록
+            "last_sync_time": self.checkpoint_data[self.account]["sync_start_time"]
+        })
         logger.debug(f"체크포인트 데이터: {checkpoint}")
         return checkpoint
     
@@ -1285,13 +1310,34 @@ class CheckpointManager:
                 "status": "not_started",
                 "failed_uids": [],
                 "skipped_uids": [],
-                "last_sync_time": self.checkpoint_data[self.account]["sync_start_time"]
+                "last_sync_time": self.checkpoint_data[self.account]["sync_start_time"],
+                "sync_history": []  # 동기화 히스토리 초기화
             }
         
         folder_data = self.checkpoint_data[self.account]["folders"][normalized_path]
         
-        # 이전 상태가 completed이고 새로운 동기화가 시작되면 processed_count 누적
+        # 이전 상태가 completed이고 새로운 동기화가 시작되면 히스토리에 기록
         if folder_data["status"] == "completed" and status == "in_progress":
+            # 이전 동기화 정보를 히스토리에 추가
+            history_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "previous_total": folder_data["total_count"],
+                "new_messages": total_count - folder_data["total_count"],
+                "last_uid": folder_data["last_uid"],
+                "processed_count": folder_data["processed_count"],
+                "failed_uids": folder_data["failed_uids"].copy(),
+                "skipped_uids": folder_data["skipped_uids"].copy()
+            }
+            folder_data["sync_history"].append(history_entry)
+            logger.info(f"동기화 히스토리 추가 - 폴더: {normalized_path}\n"
+                       f"- 이전 총 메일 수: {history_entry['previous_total']}\n"
+                       f"- 새로운 메일 수: {history_entry['new_messages']}\n"
+                       f"- 처리된 메일 수: {history_entry['processed_count']}\n"
+                       f"- 마지막 UID: {history_entry['last_uid']}\n"
+                       f"- 실패한 UID 수: {len(history_entry['failed_uids'])}\n"
+                       f"- 건너뛴 UID 수: {len(history_entry['skipped_uids'])}\n"
+            )
+            
             folder_data["processed_count"] += processed_count
             folder_data["total_count"] = total_count
         else:
@@ -1359,6 +1405,12 @@ class CheckpointManager:
         folder_data = self.checkpoint_data[self.account]["folders"].get(normalized_path, {})
         sync_time = folder_data.get("last_sync_time", self.checkpoint_data[self.account]["sync_start_time"])
         return datetime.fromisoformat(sync_time)
+
+    def get_folder_sync_history(self, folder_path):
+        """폴더의 동기화 히스토리 조회"""
+        normalized_path = self._normalize_folder_path(folder_path)
+        folder_data = self.checkpoint_data[self.account]["folders"].get(normalized_path, {})
+        return folder_data.get("sync_history", [])
 
 async def main():
     parser = argparse.ArgumentParser(description='IMAP 서버에서 이메일을 EML 파일로 다운로드')
