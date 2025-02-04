@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+from datetime import datetime
 import logging
 import inspect
 import os
@@ -986,6 +987,24 @@ class CanvasTemplate(DataBaseModel):
 
     class Meta:
         db_table = "canvas_template"
+
+
+class EmailAccount(DataBaseModel):
+    id = CharField(max_length=32, primary_key=True)
+    user_id = CharField(max_length=32, null=False, index=True)
+    email = CharField(max_length=255, null=False, help_text="email address", index=True)
+    password = CharField(max_length=255, null=True, help_text="email password or app password")
+    imap_host = CharField(max_length=255, null=False, help_text="IMAP server host")
+    imap_port = IntegerField(null=False, default=993, help_text="IMAP server port")
+    auth_type = CharField(max_length=10, null=False, default="BASIC", help_text="IMAP auth type (BASIC or XOAUTH2)")
+    access_token = CharField(max_length=2048, null=True, help_text="OAuth2 access token")
+    last_sync_time = DateTimeField(null=True, index=True)
+    status = CharField(max_length=1, null=True, help_text="account status(0: disabled, 1: enabled)", default="1", index=True)
+    created_at = DateTimeField(default=datetime.now)
+    updated_at = DateTimeField(default=datetime.now)
+
+    class Meta:
+        db_table = "email_account"
 
 
 def migrate_db():

@@ -44,15 +44,6 @@ from rag.settings import print_rag_settings
 from flask import jsonify
 
 
-def update_progress():
-    while True:
-        time.sleep(3)
-        try:
-            DocumentService.update_progress()
-        except Exception:
-            logging.exception("update_progress exception")
-
-
 @app.route('/health')
 def health_check():
     return jsonify({
@@ -100,13 +91,12 @@ if __name__ == '__main__':
 
     RuntimeConfig.DEBUG = args.debug
     if RuntimeConfig.DEBUG:
-        logging.info("run on debug mode")
+        app.debug = True
+        app.config['DEBUG'] = True
+        logging.info("Debug mode enabled")
 
     RuntimeConfig.init_env()
     RuntimeConfig.init_config(JOB_SERVER_HOST=settings.HOST_IP, HTTP_PORT=settings.HOST_PORT)
-
-    thread = ThreadPoolExecutor(max_workers=1)
-    thread.submit(update_progress)
 
     # start http server
     try:
@@ -115,7 +105,7 @@ if __name__ == '__main__':
             hostname=settings.HOST_IP,
             port=settings.HOST_PORT,
             application=app,
-            threaded=True,
+            threaded=RuntimeConfig.DEBUG,
             use_reloader=RuntimeConfig.DEBUG,
             use_debugger=RuntimeConfig.DEBUG,
         )
