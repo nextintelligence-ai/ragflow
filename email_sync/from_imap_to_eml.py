@@ -534,6 +534,39 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
     
     with Timer("이메일 저장", logger):
         try:
+            # 이메일 날짜 추출
+            date_str = 'unknown_date'
+            date_tuple = email.utils.parsedate_tz(email_message['Date'])
+            if date_tuple:
+                try:
+                    date = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
+                    date_str = date.strftime('%Y%m%d_%H%M%S')
+                except Exception as e:
+                    logger.warning(f"날짜 변환 실패: {str(e)}")
+            
+            # 제목 처리
+            raw_subject = email_message.get('Subject', 'no_subject')
+            safe_subject = 'no_subject'
+            try:
+                subject = decode_header(raw_subject)
+                if subject:
+                    safe_subject = "".join(x for x in subject if x.isalnum() or x in (' ', '-', '_'))[:50]
+                    if not safe_subject.strip():
+                        safe_subject = 'no_subject'
+            except Exception as e:
+                logger.error(f"제목 처리 실패: {str(e)}")
+            
+            # 파일 경로 설정
+            filename = f"{date_str}_{safe_subject}_uid{uid}.eml"
+            folder_path = folder_path.replace('"', '').replace('/', os.path.sep)
+            folder_dir = os.path.join(output_dir, folder_path)
+            filepath = os.path.join(folder_dir, filename)
+
+            # 이미 파일이 존재하는지 확인
+            if os.path.exists(filepath):
+                logger.debug(f"이미 존재하는 파일 건너뜀: {filepath}")
+                return filepath, 0, 0, 0, True
+
             # 이메일 크기 및 첨부파일 정보 계산
             email_bytes = email_message.as_bytes()
             email_size = len(email_bytes)
@@ -563,33 +596,6 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
                         logger.warning(f"첨부파일 정보 처리 중 오류 발생: {str(e)}")
                     continue
             
-            # 이메일 날짜 추출
-            date_str = 'unknown_date'
-            date_tuple = email.utils.parsedate_tz(email_message['Date'])
-            if date_tuple:
-                try:
-                    date = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
-                    date_str = date.strftime('%Y%m%d_%H%M%S')
-                except Exception as e:
-                    logger.warning(f"날짜 변환 실패: {str(e)}")
-            
-            # 제목 처리
-            raw_subject = email_message.get('Subject', 'no_subject')
-            safe_subject = 'no_subject'
-            try:
-                subject = decode_header(raw_subject)
-                if subject:
-                    safe_subject = "".join(x for x in subject if x.isalnum() or x in (' ', '-', '_'))[:50]
-                    if not safe_subject.strip():
-                        safe_subject = 'no_subject'
-            except Exception as e:
-                logger.error(f"제목 처리 실패: {str(e)}")
-            
-            # 파일 경로 설정
-            filename = f"{date_str}_{safe_subject}_uid{uid}.eml"
-            folder_path = folder_path.replace('"', '').replace('/', os.path.sep)
-            folder_dir = os.path.join(output_dir, folder_path)
-            
             # 폴더 생성 시도 (최대 3번)
             for attempt in range(3):
                 try:
@@ -602,7 +608,6 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
                         raise
                     await asyncio.sleep(0.1)  # 잠시 대기 후 재시도
             
-            filepath = os.path.join(folder_dir, filename)
             temp_filepath = f"{filepath}.tmp"
             
             # 임시 파일로 저장 (최대 3번 시도)
@@ -671,7 +676,7 @@ async def save_email_to_eml(email_message, output_dir, folder_path, uid):
                 if os.path.exists(filepath):
                     os.remove(filepath)
                 os.rename(temp_filepath, filepath)
-                logger.info(f"이메일 저장 성공: {filepath}")
+                logger.info(f"새로운 이메일 저장 성공: {filepath}")
                 return filepath, email_size, attachment_count, attachment_size, False
             except Exception as move_error:
                 logger.error(f"파일 이동 실패, 복사 시도: {str(move_error)}")
@@ -747,6 +752,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                         # 시간까지 정확하게 필터링하기 위해 각 메시지의 날짜 확인
                         message_uids = message_data[0].split()
                         filtered_uids = []
+                        new_message_count = 0  # 실제 새로운 메일 수를 추적
                         
                         for uid in message_uids:
                             uid_int = int(uid.decode())
@@ -774,6 +780,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                                 # 동기화 시작 시간 이후의 메시지만 포함
                                                 if email_date >= last_sync_time:
                                                     filtered_uids.append(uid)
+                                                    new_message_count += 1  # 실제 새로운 메일 수 증가
                                                     logger.debug(f"새로운 메일 발견 - UID: {uid_int}, 날짜: {email_date}")
                                                 else:
                                                     logger.debug(f"시간 필터링으로 제외된 메시지 - UID: {uid_int}, 날짜: {email_date}")
@@ -783,11 +790,10 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                                 logger.warning(f"메시지 헤더 조회 실패 (UID: {uid_int}): {str(e)}")
                         
                         message_uids = filtered_uids
-                        new_message_count = len(message_uids)
                         logger.info(f"새로운 메일 발견: {new_message_count}통 (전체 검색 결과: {len(message_data[0].split())}통)")
                         
                         if new_message_count > 0:
-                            # total_count는 기존 값 유지하고 새로운 메일 수를 더함
+                            # total_count는 실제 새로운 메일 수만큼만 증가
                             total_count = checkpoint["total_count"] + new_message_count
                             processed_count = 0
                         else:
@@ -824,7 +830,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                 # 새로운 동기화인 경우 processed_count는 0부터 시작
                 if last_sync_time:
                     processed_count = 0
-                    # total_count는 기존 값 유지하고 새로운 메일 수를 더함
+                    # total_count는 실제 새로운 메일 수만큼만 증가
                     total_count = checkpoint["total_count"] + message_count
                 else:
                     # 초기 동기화 중인 경우
@@ -1318,27 +1324,30 @@ class CheckpointManager:
         
         # 이전 상태가 completed이고 새로운 동기화가 시작되면 히스토리에 기록
         if folder_data["status"] == "completed" and status == "in_progress":
-            # 이전 동기화 정보를 히스토리에 추가
-            history_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "previous_total": folder_data["total_count"],
-                "new_messages": total_count - folder_data["total_count"],
-                "last_uid": folder_data["last_uid"],
-                "processed_count": folder_data["processed_count"],
-                "failed_uids": folder_data["failed_uids"].copy(),
-                "skipped_uids": folder_data["skipped_uids"].copy()
-            }
-            folder_data["sync_history"].append(history_entry)
-            logger.info(f"동기화 히스토리 추가 - 폴더: {normalized_path}\n"
-                       f"- 이전 총 메일 수: {history_entry['previous_total']}\n"
-                       f"- 새로운 메일 수: {history_entry['new_messages']}\n"
-                       f"- 처리된 메일 수: {history_entry['processed_count']}\n"
-                       f"- 마지막 UID: {history_entry['last_uid']}\n"
-                       f"- 실패한 UID 수: {len(history_entry['failed_uids'])}\n"
-                       f"- 건너뛴 UID 수: {len(history_entry['skipped_uids'])}\n"
-            )
+            # 실제 새로운 메일 수 계산
+            new_messages = total_count - folder_data["total_count"]
+            if new_messages > 0:
+                # 이전 동기화 정보를 히스토리에 추가
+                history_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "previous_total": folder_data["total_count"],
+                    "new_messages": new_messages,  # 실제 새로운 메일 수
+                    "last_uid": folder_data["last_uid"],
+                    "processed_count": folder_data["processed_count"],
+                    "failed_uids": folder_data["failed_uids"].copy(),
+                    "skipped_uids": folder_data["skipped_uids"].copy()
+                }
+                folder_data["sync_history"].append(history_entry)
+                logger.info(f"동기화 히스토리 추가 - 폴더: {normalized_path}\n"
+                           f"- 이전 총 메일 수: {history_entry['previous_total']}\n"
+                           f"- 새로운 메일 수: {history_entry['new_messages']}\n"
+                           f"- 처리된 메일 수: {history_entry['processed_count']}\n"
+                           f"- 마지막 UID: {history_entry['last_uid']}\n"
+                           f"- 실패한 UID 수: {len(history_entry['failed_uids'])}\n"
+                           f"- 건너뛴 UID 수: {len(history_entry['skipped_uids'])}\n"
+                )
             
-            folder_data["processed_count"] += processed_count
+            folder_data["processed_count"] = processed_count
             folder_data["total_count"] = total_count
         else:
             # 기존 처리 방식 유지
