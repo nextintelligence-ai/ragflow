@@ -1421,6 +1421,29 @@ class CheckpointManager:
         folder_data = self.checkpoint_data[self.account]["folders"].get(normalized_path, {})
         return folder_data.get("sync_history", [])
 
+    def has_checkpoint(self):
+        """체크포인트 파일 존재 여부와 계정 데이터 존재 여부 확인"""
+        # 1. 체크포인트 파일이 존재하는지 확인
+        if not os.path.exists(self.checkpoint_file):
+            return False
+            
+        # 2. 체크포인트 데이터가 비어있지 않은지 확인
+        if not self.checkpoint_data:
+            return False
+            
+        # 3. 해당 이메일 계정의 데이터가 존재하는지 확인
+        if self.account not in self.checkpoint_data:
+            return False
+            
+        # 4. 계정의 폴더 데이터가 존재하는지 확인
+        account_data = self.checkpoint_data[self.account]
+        if not account_data.get("folders"):
+            return False
+            
+        # 모든 조건을 만족하면 True 반환
+        return True
+
+
 async def main():
     parser = argparse.ArgumentParser(description='IMAP 서버에서 이메일을 EML 파일로 다운로드')
     parser.add_argument('--host', default=os.getenv('IMAP_HOST'), help='IMAP 서버 주소')

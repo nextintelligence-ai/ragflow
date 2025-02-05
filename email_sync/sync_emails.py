@@ -176,6 +176,14 @@ async def sync_all_accounts(accounts):
             
             kb_id = kb.id
             
+            # 첫 동기화 여부 확인 (체크포인트 파일 존재 여부로 판단)
+            is_first_sync = not checkpoint_manager.has_checkpoint()
+            
+            if is_first_sync:
+                logger.info(f"첫 동기화 시작: {account['email']}")
+            else:
+                logger.info(f"증분 동기화 시작: {account['email']}")
+            
             # 각 폴더 처리
             for folder_path in folder_paths:
                 await process_folder(imap, folder_path, output_dir, 10, checkpoint_manager)
@@ -215,20 +223,24 @@ async def sync_all_accounts(accounts):
                                         logger.error(f"파일 업로드 실패: {kb_id}, 오류: {str(err)}")
                                         continue
                                     
-                                    doc_id = doc[0][0].get('id')
+                                    # 첫 동기화가 아닌 경우에만 태스크 큐에 추가
+                                    if not is_first_sync:
+                                        doc_id = doc[0][0].get('id')
                                         
-                                    # 문서 정보 가져오기
-                                    e, doc = DocumentService.get_by_id(doc_id)
-                                    if not e:
-                                        logger.error(f"문서를 찾을 수 없음: {doc_id}")
-                                        continue
-                                        
-                                    # 문서 처리를 위한 태스크 추가
-                                    doc_dict = doc.to_dict()
-                                    doc_dict["tenant_id"] = account['user_id']
-                                    bucket, name = File2DocumentService.get_storage_address(doc_id=doc.id)
-                                    queue_tasks(doc_dict, bucket, name)
-                                    logger.info(f"태스크 큐에 추가됨: {doc.id}")
+                                        # 문서 정보 가져오기
+                                        e, doc = DocumentService.get_by_id(doc_id)
+                                        if not e:
+                                            logger.error(f"문서를 찾을 수 없음: {doc_id}")
+                                            continue
+                                            
+                                        # 문서 처리를 위한 태스크 추가
+                                        doc_dict = doc.to_dict()
+                                        doc_dict["tenant_id"] = account['user_id']
+                                        bucket, name = File2DocumentService.get_storage_address(doc_id=doc.id)
+                                        queue_tasks(doc_dict, bucket, name)
+                                        logger.info(f"태스크 큐에 추가됨: {doc.id}")
+                                    else:
+                                        logger.info(f"첫 동기화 - 파일만 업로드: {file_name}")
                 except Exception as e:
                     logger.error(f"폴더 업로드 중 오류 발생: {folder_path}, 오류: {str(e)}")
             
