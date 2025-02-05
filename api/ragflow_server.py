@@ -44,6 +44,15 @@ from rag.settings import print_rag_settings
 from flask import jsonify
 
 
+def update_progress():
+    while True:
+        time.sleep(3)
+        try:
+            DocumentService.update_progress()
+        except Exception:
+            logging.exception("update_progress exception")
+
+
 @app.route('/health')
 def health_check():
     return jsonify({
