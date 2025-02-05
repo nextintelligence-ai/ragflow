@@ -6,6 +6,9 @@ import logging
 from datetime import datetime
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.file_service import FileService
+from api.db.services.file2document_service import File2DocumentService
+from api.db.services.task_service import queue_tasks
+from api.db.services.document_service import DocumentService
 import tempfile
 import shutil
 from pathlib import Path
@@ -198,10 +201,25 @@ async def sync_all_accounts(accounts):
                                         stream=f,
                                         filename=os.path.basename(file_path)
                                     )
-                                    err, _ = FileService.upload_document(kb, [file_obj], account['user_id'])
+                                    err, doc = FileService.upload_document(kb, [file_obj], account['user_id'])
                                     if err:
                                         logger.error(f"파일 업로드 실패: {kb_id}, 오류: {str(err)}")
                                         continue
+                                    
+                                    doc_id = doc[0][0].get('id')
+                                        
+                                    # 문서 정보 가져오기
+                                    e, doc = DocumentService.get_by_id(doc_id)
+                                    if not e:
+                                        logger.error(f"문서를 찾을 수 없음: {doc_id}")
+                                        continue
+                                        
+                                    # 문서 처리를 위한 태스크 추가
+                                    doc_dict = doc.to_dict()
+                                    doc_dict["tenant_id"] = account['user_id']
+                                    bucket, name = File2DocumentService.get_storage_address(doc_id=doc.id)
+                                    queue_tasks(doc_dict, bucket, name)
+                                    logger.info(f"태스크 큐에 추가됨: {doc.id}")
                 except Exception as e:
                     logger.error(f"폴더 업로드 중 오류 발생: {folder_path}, 오류: {str(e)}")
             
@@ -211,12 +229,12 @@ async def sync_all_accounts(accounts):
             EmailAccountService.update_sync_time(account['id'])
             
             # 임시 디렉토리 정리
-            try:
-                if os.path.exists(output_dir):
-                    shutil.rmtree(output_dir)
-                    logger.info(f"임시 디렉토리 삭제 완료: {output_dir}")
-            except Exception as cleanup_error:
-                logger.error(f"임시 디렉토리 정리 실패: {output_dir}, 오류: {str(cleanup_error)}")
+            # try:
+            #     if os.path.exists(output_dir):
+            #         shutil.rmtree(output_dir)
+            #         logger.info(f"임시 디렉토리 삭제 완료: {output_dir}")
+            # except Exception as cleanup_error:
+            #     logger.error(f"임시 디렉토리 정리 실패: {output_dir}, 오류: {str(cleanup_error)}")
             
         except Exception as e:
             logger.error(f"계정 {account['email']} 동기화 중 오류 발생: {str(e)}")
