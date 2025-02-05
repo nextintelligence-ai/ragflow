@@ -674,8 +674,8 @@ class Knowledgebase(DataBaseModel):
     language = CharField(
         max_length=32,
         null=True,
-        default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English",
-        help_text="English|Chinese",
+        default="Korean",
+        help_text="English|Chinese|Korean",
         index=True)
     description = TextField(null=True, help_text="KB description")
     embd_id = CharField(
@@ -702,7 +702,7 @@ class Knowledgebase(DataBaseModel):
         help_text="default parser ID",
         default=ParserType.NAIVE.value,
         index=True)
-    parser_config = JSONField(null=False, default={"pages": [[1, 1000000]]})
+    parser_config = JSONField(null=False, default={"pages": [[1, 1000000]], "delimiter": "\n!?;。；！？.,:，：』」"})
     pagerank = IntegerField(default=0, index=False)
     status = CharField(
         max_length=1,
