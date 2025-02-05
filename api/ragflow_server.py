@@ -106,6 +106,9 @@ if __name__ == '__main__':
 
     RuntimeConfig.init_env()
     RuntimeConfig.init_config(JOB_SERVER_HOST=settings.HOST_IP, HTTP_PORT=settings.HOST_PORT)
+    
+    thread = ThreadPoolExecutor(max_workers=1)
+    thread.submit(update_progress)
 
     # start http server
     try:

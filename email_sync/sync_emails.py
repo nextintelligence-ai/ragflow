@@ -193,13 +193,22 @@ async def sync_all_accounts(accounts):
                                     continue
                                     
                                 file_path = os.path.join(root, file)
+                                file_name = os.path.basename(file_path)
                                 
+                                # 이미 존재하는 파일인지 확인
+                                existing_docs = DocumentService.query(name=file_name, kb_id=kb_id)
+                                if existing_docs:
+                                    logger.info(f"이미 존재하는 파일 건너뜀: {file_name}")
+                                    # 파일 삭제
+                                    os.remove(file_path)
+                                    continue
+
                                 # File 객체 생성
                                 from werkzeug.datastructures import FileStorage
                                 with open(file_path, 'rb') as f:
                                     file_obj = FileStorage(
                                         stream=f,
-                                        filename=os.path.basename(file_path)
+                                        filename=file_name
                                     )
                                     err, doc = FileService.upload_document(kb, [file_obj], account['user_id'])
                                     if err:
