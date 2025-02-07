@@ -26,7 +26,17 @@ from hanziconv import HanziConv
 from nltk import word_tokenize
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from api.utils.file_utils import get_project_base_directory
+import nltk
 
+# NLTK 데이터 초기화
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/wordnet')
+    nltk.data.find('omw-1.4')
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('wordnet')
+    nltk.download('omw-1.4')
 
 class RagTokenizer:
     def key_(self, line):
@@ -65,8 +75,18 @@ class RagTokenizer:
 
         self.stemmer = PorterStemmer()
         self.lemmatizer = WordNetLemmatizer()
+        
+        # WordNet 초기화 및 use_wordnet 속성 설정
+        try:
+            from nltk.corpus import wordnet
+            # WordNet이 실제로 사용 가능한지 테스트
+            test_word = wordnet.synsets('test')
+            self.use_wordnet = True
+        except Exception as e:
+            logging.warning(f"WordNet 초기화 실패: {str(e)}, 기본 토큰화만 사용됩니다.")
+            self.use_wordnet = False
 
-        self.SPLIT_CHAR = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-z\.-]+|[0-9,\.-]+)"
+        self.SPLIT_CHAR = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；'':""【】~！￥%……（）——-]+|[a-z\.-]+|[0-9,\.-]+)"
 
         trie_file_name = self.DIR_ + ".txt.trie"
         # check if trie file existence
@@ -269,7 +289,14 @@ class RagTokenizer:
         line = self._tradi2simp(line)
         zh_num = len([1 for c in line if is_chinese(c)])
         if zh_num == 0:
-            return " ".join([self.stemmer.stem(self.lemmatizer.lemmatize(t)) for t in word_tokenize(line)])
+            try:
+                if self.use_wordnet:
+                    return " ".join([self.stemmer.stem(self.lemmatizer.lemmatize(t)) for t in word_tokenize(line)])
+                else:
+                    return " ".join([self.stemmer.stem(t) for t in word_tokenize(line)])
+            except Exception as e:
+                logging.warning(f"토큰화 중 오류 발생: {str(e)}")
+                return line  # 오류 발생시 원본 텍스트 반환
 
         arr = re.split(self.SPLIT_CHAR, line)
         res = []
