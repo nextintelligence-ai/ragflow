@@ -43,6 +43,7 @@ import resource
 import psutil
 from functools import lru_cache
 import gc
+import signal
 
 import numpy as np
 from peewee import DoesNotExist
@@ -97,6 +98,8 @@ DONE_TASKS = 0
 FAILED_TASKS = 0
 CURRENT_TASK = None
 
+# 전역 변수로 스레드 객체 저장
+background_thread = None
 
 class TaskCanceledException(Exception):
     def __init__(self, msg):
@@ -201,7 +204,8 @@ def build_chunks(task, progress_callback):
         st = timer()
         bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
         binary = get_storage_binary(bucket, name)
-        if isinstance(binary, bytes) and len(binary) > 10 * 1024 * 1024:  # 10MB 이상
+        if isinstance(binary, bytes):
+            # 메모리 최적화: 모든 바이너리 데이터를 스트림으로 처리
             binary = BytesIO(binary)
         logging.info("From minio({}) {}/{}".format(timer() - st, task["location"], task["name"]))
     except TimeoutError:
@@ -218,9 +222,11 @@ def build_chunks(task, progress_callback):
         raise
 
     try:
-        cks = chunker.chunk(task["name"], binary=binary, from_page=task["from_page"],
+        # 메모리 최적화: 제너레이터로 청크 처리
+        for chunk in chunker.chunk(task["name"], binary=binary, from_page=task["from_page"],
                             to_page=task["to_page"], lang=task["language"], callback=progress_callback,
-                            kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"])
+                            kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"]):
+            yield chunk
         logging.info("Chunking({}) {}/{} done".format(timer() - st, task["location"], task["name"]))
     except TaskCanceledException:
         raise
@@ -229,168 +235,58 @@ def build_chunks(task, progress_callback):
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
 
-    docs = []
-    doc = {
-        "doc_id": task["doc_id"],
-        "kb_id": str(task["kb_id"])
-    }
-    if task["pagerank"]:
-        doc[PAGERANK_FLD] = int(task["pagerank"])
-    el = 0
-    for ck in cks:
-        d = copy.deepcopy(doc)
-        d.update(ck)
-        d["id"] = xxhash.xxh64((ck["content_with_weight"] + str(d["doc_id"])).encode("utf-8")).hexdigest()
-        d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
-        d["create_timestamp_flt"] = datetime.now().timestamp()
-        if not d.get("image"):
-            _ = d.pop("image", None)
-            d["img_id"] = ""
-            docs.append(d)
-            continue
-
-        try:
-            output_buffer = BytesIO()
-            if isinstance(d["image"], bytes):
-                output_buffer = BytesIO(d["image"])
-            else:
-                d["image"].save(output_buffer, format='JPEG')
-
-            st = timer()
-            STORAGE_IMPL.put(task["kb_id"], d["id"], output_buffer.getvalue())
-            el += timer() - st
-        except Exception:
-            logging.exception(
-                "Saving image of chunk {}/{}/{} got exception".format(task["location"], task["name"], d["id"]))
-            raise
-
-        d["img_id"] = "{}-{}".format(task["kb_id"], d["id"])
-        del d["image"]
-        docs.append(d)
-    logging.info("MINIO PUT({}):{}".format(task["name"], el))
-
-    if task["parser_config"].get("auto_keywords", 0):
-        st = timer()
-        progress_callback(msg="Start to generate keywords for every chunk ...")
-        chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
-        for d in docs:
-            cached = get_llm_cache(chat_mdl.llm_name, d["content_with_weight"], "keywords",
-                                   {"topn": task["parser_config"]["auto_keywords"]})
-            if not cached:
-                cached = keyword_extraction(chat_mdl, d["content_with_weight"],
-                                            task["parser_config"]["auto_keywords"])
-                if cached:
-                    set_llm_cache(chat_mdl.llm_name, d["content_with_weight"], cached, "keywords",
-                                  {"topn": task["parser_config"]["auto_keywords"]})
-
-            d["important_kwd"] = cached.split(",")
-            d["important_tks"] = rag_tokenizer.tokenize(" ".join(d["important_kwd"]))
-        progress_callback(msg="Keywords generation completed in {:.2f}s".format(timer() - st))
-
-    if task["parser_config"].get("auto_questions", 0):
-        st = timer()
-        progress_callback(msg="Start to generate questions for every chunk ...")
-        chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
-        for d in docs:
-            cached = get_llm_cache(chat_mdl.llm_name, d["content_with_weight"], "question",
-                                   {"topn": task["parser_config"]["auto_questions"]})
-            if not cached:
-                cached = question_proposal(chat_mdl, d["content_with_weight"], task["parser_config"]["auto_questions"])
-                if cached:
-                    set_llm_cache(chat_mdl.llm_name, d["content_with_weight"], cached, "question",
-                                  {"topn": task["parser_config"]["auto_questions"]})
-
-            d["question_kwd"] = cached.split("\n")
-            d["question_tks"] = rag_tokenizer.tokenize("\n".join(d["question_kwd"]))
-        progress_callback(msg="Question generation completed in {:.2f}s".format(timer() - st))
-
-    if task["kb_parser_config"].get("tag_kb_ids", []):
-        progress_callback(msg="Start to tag for every chunk ...")
-        kb_ids = task["kb_parser_config"]["tag_kb_ids"]
-        tenant_id = task["tenant_id"]
-        topn_tags = task["kb_parser_config"].get("topn_tags", 3)
-        S = 1000
-        st = timer()
-        examples = []
-        all_tags = get_tags_from_cache(kb_ids)
-        if not all_tags:
-            all_tags = settings.retrievaler.all_tags_in_portion(tenant_id, kb_ids, S)
-            set_tags_to_cache(kb_ids, all_tags)
-        else:
-            all_tags = json.loads(all_tags)
-
-        chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
-        for d in docs:
-            if settings.retrievaler.tag_content(tenant_id, kb_ids, d, all_tags, topn_tags=topn_tags, S=S):
-                examples.append({"content": d["content_with_weight"], TAG_FLD: d[TAG_FLD]})
-                continue
-            cached = get_llm_cache(chat_mdl.llm_name, d["content_with_weight"], all_tags, {"topn": topn_tags})
-            if not cached:
-                cached = content_tagging(chat_mdl, d["content_with_weight"], all_tags,
-                                         random.choices(examples, k=2) if len(examples)>2 else examples,
-                                         topn=topn_tags)
-                if cached:
-                    set_llm_cache(chat_mdl.llm_name, d["content_with_weight"], cached, all_tags, {"topn": topn_tags})
-            d[TAG_FLD] = json.loads(cached)
-
-        progress_callback(msg="Tagging completed in {:.2f}s".format(timer() - st))
-
-    return docs
-
-
-def init_kb(row, vector_size: int):
-    idxnm = search.index_name(row["tenant_id"])
-    return settings.docStoreConn.createIdx(idxnm, row.get("kb_id", ""), vector_size)
-
 
 def embedding(docs, mdl, parser_config=None, callback=None):
     if parser_config is None:
         parser_config = {}
-    batch_size = min(16, max(1, len(docs) // 4))  # 문서 수에 따라 동적으로 조정
+    batch_size = min(8, max(1, len(docs) // 8))  # 배치 크기 축소
     
     def batch_generator(items, batch_size):
-        for i in range(0, len(items), batch_size):
-            yield items[i:i + batch_size]
+        batch = []
+        for item in items:
+            batch.append(item)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
     
-    tts, cnts = [], []
-    for d in docs:
-        tts.append(d.get("docnm_kwd", "Title"))
-        c = "\n".join(d.get("question_kwd", []))
-        if not c:
-            c = d["content_with_weight"]
-        c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
-        if not c:
-            c = "None"
-        cnts.append(c)
-        
     tk_count = 0
-    if len(tts) == len(cnts):
-        tts_ = []  # 리스트로 변경하여 메모리 효율성 향상
-        for batch in batch_generator(tts, batch_size):
-            vts, c = mdl.encode(batch)
-            tts_.extend(vts)
-            tk_count += c
-            callback(prog=0.6 + 0.1 * len(tts_) / len(tts), msg="")
-        tts = np.array(tts_)  # 마지막에 한 번만 numpy 배열로 변환
-
-    cnts_ = []  # 리스트로 변경
-    for batch in batch_generator(cnts, batch_size):
-        vts, c = mdl.encode(batch)
-        cnts_.extend(vts)
-        tk_count += c
-        callback(prog=0.7 + 0.2 * len(cnts_) / len(cnts), msg="")
-    cnts = np.array(cnts_)  # 마지막에 한 번만 numpy 배열로 변환
-
-    title_w = float(parser_config.get("filename_embd_weight", 0.1))
-    vects = (title_w * tts + (1 - title_w) *
-             cnts) if len(tts) == len(cnts) else cnts
-
-    assert len(vects) == len(docs)
     vector_size = 0
-    for i, d in enumerate(docs):
-        v = vects[i].tolist()
-        vector_size = len(v)
-        d["q_%d_vec" % len(v)] = v
+    
+    # 메모리 최적화: 스트리밍 방식으로 처리
+    for doc_batch in batch_generator(docs, batch_size):
+        # 타이틀 임베딩
+        titles = [d.get("docnm_kwd", "Title") for d in doc_batch]
+        title_embeddings, c = mdl.encode(titles)
+        tk_count += c
+        
+        # 컨텐츠 임베딩
+        contents = []
+        for d in doc_batch:
+            c = "\n".join(d.get("question_kwd", []))
+            if not c:
+                c = d["content_with_weight"]
+            c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
+            if not c:
+                c = "None"
+            contents.append(c)
+        
+        content_embeddings, c = mdl.encode(contents)
+        tk_count += c
+        
+        # 가중치 적용 및 벡터 저장
+        title_w = float(parser_config.get("filename_embd_weight", 0.1))
+        for i, doc in enumerate(doc_batch):
+            vec = (title_w * title_embeddings[i] + (1 - title_w) * content_embeddings[i]).tolist()
+            vector_size = len(vec)
+            doc["q_%d_vec" % vector_size] = vec
+            
+        # 메모리 해제
+        del title_embeddings
+        del content_embeddings
+        gc.collect()
+        
     return tk_count, vector_size
 
 
@@ -471,141 +367,154 @@ def log_document_structure(chunks):
 
 
 def do_handle_task(task):
-    task_id = task["id"]
-    task_from_page = task["from_page"]
-    task_to_page = task["to_page"]
-    task_tenant_id = task["tenant_id"]
-    task_embedding_id = task["embd_id"]
-    task_language = task["language"]
-    task_llm_id = task["llm_id"]
-    task_dataset_id = task["kb_id"]
-    task_doc_id = task["doc_id"]
-    task_document_name = task["name"]
-    task_parser_config = task["parser_config"]
-
-    # prepare the progress callback function
-    progress_callback = partial(set_progress, task_id, task_from_page, task_to_page)
-
-    # FIXME: workaround, Infinity doesn't support table parsing method, this check is to notify user
-    lower_case_doc_engine = settings.DOC_ENGINE.lower()
-    if lower_case_doc_engine == 'infinity' and task['parser_id'].lower() == 'table':
-        error_message = "Table parsing method is not supported by Infinity, please use other parsing methods or use Elasticsearch as the document engine."
-        progress_callback(-1, msg=error_message)
-        raise Exception(error_message)
-
+    global DONE_TASKS, FAILED_TASKS, CURRENT_TASK
+    
     try:
-        task_canceled = TaskService.do_cancel(task_id)
-    except DoesNotExist:
-        logging.warning(f"task {task_id} is unknown")
-        return
-    if task_canceled:
-        progress_callback(-1, msg="Task has been canceled.")
-        return
+        # 현재 작업 상태 업데이트 및 heartbeat 전송
+        with mt_lock:
+            CURRENT_TASK = copy.deepcopy(task)
+        
+        now = datetime.now()
+        heartbeat = json.dumps({
+            "name": CONSUMER_NAME,
+            "now": now.astimezone().isoformat(timespec="milliseconds"),
+            "boot_at": BOOT_AT,
+            "pending": PENDING_TASKS,
+            "lag": LAG_TASKS,
+            "done": DONE_TASKS,
+            "failed": FAILED_TASKS,
+            "current": CURRENT_TASK,
+        })
+        REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now.timestamp())
+        
+        # 기존 task 처리 로직
+        task_id = task["id"]
+        task_from_page = task["from_page"]
+        task_to_page = task["to_page"]
+        task_tenant_id = task["tenant_id"]
+        task_embedding_id = task["embd_id"]
+        task_language = task["language"]
+        task_llm_id = task["llm_id"]
+        task_dataset_id = task["kb_id"]
+        task_doc_id = task["doc_id"]
+        task_document_name = task["name"]
+        task_parser_config = task["parser_config"]
 
-    try:
-        # bind embedding model
-        embedding_model = LLMBundle(task_tenant_id, LLMType.EMBEDDING, llm_name=task_embedding_id, lang=task_language)
-    except Exception as e:
-        error_message = f'Fail to bind embedding model: {str(e)}'
-        progress_callback(-1, msg=error_message)
-        logging.exception(error_message)
-        raise
+        # prepare the progress callback function
+        progress_callback = partial(set_progress, task_id, task_from_page, task_to_page)
 
-    # Either using RAPTOR or Standard chunking methods
-    if task.get("task_type", "") == "raptor":
+        # FIXME: workaround, Infinity doesn't support table parsing method, this check is to notify user
+        lower_case_doc_engine = settings.DOC_ENGINE.lower()
+        if lower_case_doc_engine == 'infinity' and task['parser_id'].lower() == 'table':
+            error_message = "Table parsing method is not supported by Infinity, please use other parsing methods or use Elasticsearch as the document engine."
+            progress_callback(-1, msg=error_message)
+            raise Exception(error_message)
+
         try:
-            # bind LLM for raptor
-            chat_model = LLMBundle(task_tenant_id, LLMType.CHAT, llm_name=task_llm_id, lang=task_language)
+            task_canceled = TaskService.do_cancel(task_id)
+        except DoesNotExist:
+            logging.warning(f"task {task_id} is unknown")
+            return
+        if task_canceled:
+            progress_callback(-1, msg="Task has been canceled.")
+            return
 
-            # run RAPTOR
-            chunks, token_count, vector_size = run_raptor(task, chat_model, embedding_model, progress_callback)
-            
-            # 문서 구조 로깅 추가
-            progress_callback(msg="문서 구조 로깅 중...")
-            log_document_structure(chunks)
-            
-        except TaskCanceledException:
-            raise
+        try:
+            # bind embedding model
+            embedding_model = LLMBundle(task_tenant_id, LLMType.EMBEDDING, llm_name=task_embedding_id, lang=task_language)
         except Exception as e:
-            error_message = f'Fail to bind LLM used by RAPTOR: {str(e)}'
+            error_message = f'Fail to bind embedding model: {str(e)}'
             progress_callback(-1, msg=error_message)
             logging.exception(error_message)
             raise
-    else:
-        # Standard chunking methods
-        start_ts = timer()
-        chunks = build_chunks(task, progress_callback)
-        logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
-        if chunks is None:
-            return
-        if not chunks:
-            progress_callback(1., msg=f"No chunk built from {task_document_name}")
-            return
 
-        # 문서 구조 로깅 추가
-        progress_callback(msg="문서 구조 로깅 중...")
-        log_document_structure(chunks)
-
-        progress_callback(msg="Generate {} chunks".format(len(chunks)))
-        start_ts = timer()
-        try:
-            token_count, vector_size = embedding(chunks, embedding_model, task_parser_config, progress_callback)
-        except Exception as e:
-            error_message = "Generate embedding error:{}".format(str(e))
-            progress_callback(-1, error_message)
-            token_count = 0
-            raise
-        progress_message = "Embedding chunks ({:.2f}s)".format(timer() - start_ts)
-        logging.info(progress_message)
-        progress_callback(msg=progress_message)
-
-    # logging.info(f"task_executor init_kb index {search.index_name(task_tenant_id)} embedding_model {embedding_model.llm_name} vector length {vector_size}")
-    init_kb(task, vector_size)
-    chunk_count = len(set([chunk["id"] for chunk in chunks]))
-    start_ts = timer()
-    doc_store_result = ""
-    es_bulk_size = min(4, max(1, len(chunks) // 100))  # 청크 수에 따라 동적으로 조정
-    chunk_ids = []
-    
-    for b in range(0, len(chunks), es_bulk_size):
-        current_chunks = chunks[b:b + es_bulk_size]
-        doc_store_result = settings.docStoreConn.insert(current_chunks, search.index_name(task_tenant_id),
-                                                      task_dataset_id)
-        if doc_store_result:
-            error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
-            progress_callback(-1, msg=error_message)
-            # 실패 시 이미 저장된 청크 삭제
-            if chunk_ids:
-                settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
-                                          task_dataset_id)
-            raise Exception(error_message)
-            
-        chunk_ids.extend([chunk["id"] for chunk in current_chunks])
-        if b % 128 == 0:
-            progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
-            # 중간 저장
+        # Either using RAPTOR or Standard chunking methods
+        if task.get("task_type", "") == "raptor":
             try:
-                TaskService.update_chunk_ids(task["id"], " ".join(chunk_ids))
-            except DoesNotExist:
-                logging.warning(f"do_handle_task update_chunk_ids failed since task {task['id']} is unknown.")
-                settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
-                                          task_dataset_id)
-                return
+                # bind LLM for raptor
+                chat_model = LLMBundle(task_tenant_id, LLMType.CHAT, llm_name=task_llm_id, lang=task_language)
+
+                # run RAPTOR
+                chunks, token_count, vector_size = run_raptor(task, chat_model, embedding_model, progress_callback)
+                
+                # 문서 구조 로깅 추가
+                progress_callback(msg="문서 구조 로깅 중...")
+                log_document_structure(chunks)
+                
+            except TaskCanceledException:
+                raise
+            except Exception as e:
+                error_message = f'Fail to bind LLM used by RAPTOR: {str(e)}'
+                progress_callback(-1, msg=error_message)
+                logging.exception(error_message)
+                raise
+        else:
+            # Standard chunking methods
+            start_ts = timer()
+            chunks = []
+            chunk_generator = build_chunks(task, progress_callback)
+            for chunk in chunk_generator:
+                chunks.append(chunk)
+                # 메모리 모니터링
+                if len(chunks) % 100 == 0:
+                    current_memory = psutil.Process().memory_info().rss / 1024 / 1024
+                    logging.info(f"Current memory usage after {len(chunks)} chunks: {current_memory:.2f}MB")
             
-        # 메모리 해제
-        del current_chunks
-    logging.info("Indexing doc({}), page({}-{}), chunks({}), elapsed: {:.2f}".format(task_document_name, task_from_page,
-                                                                                     task_to_page, len(chunks),
-                                                                                     timer() - start_ts))
+            logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
+            if not chunks:
+                progress_callback(1., msg=f"No chunk built from {task_document_name}")
+                return
 
-    DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, chunk_count, 0)
+            # 문서 구조 로깅 최적화
+            progress_callback(msg="문서 구조 로깅 중...")
+            for i in range(0, len(chunks), 10):  # 10개씩 나눠서 로깅
+                log_document_structure(chunks[i:i+10])
+            
+            # ES 저장 최적화
+            es_bulk_size = min(2, max(1, len(chunks) // 200))  # 더 작은 배치 사이즈
+            chunk_ids = []
+            
+            for b in range(0, len(chunks), es_bulk_size):
+                current_chunks = chunks[b:b + es_bulk_size]
+                doc_store_result = settings.docStoreConn.insert(current_chunks, search.index_name(task_tenant_id),
+                                                              task_dataset_id)
+                if doc_store_result:
+                    error_message = f"Insert chunk error: {doc_store_result}"
+                    progress_callback(-1, msg=error_message)
+                    if chunk_ids:
+                        settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
+                                                  task_dataset_id)
+                    raise Exception(error_message)
+                
+                chunk_ids.extend([chunk["id"] for chunk in current_chunks])
+                if b % 64 == 0:  # 더 자주 저장
+                    progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
+                    try:
+                        TaskService.update_chunk_ids(task["id"], " ".join(chunk_ids))
+                    except DoesNotExist:
+                        logging.warning(f"do_handle_task update_chunk_ids failed since task {task['id']} is unknown.")
+                        settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
+                                                  task_dataset_id)
+                        return
+                
+                # 메모리 해제
+                del current_chunks
+                if b % 100 == 0:
+                    gc.collect()
 
-    time_cost = timer() - start_ts
-    progress_callback(prog=1.0, msg="Done ({:.2f}s)".format(time_cost))
-    logging.info(
-        "Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(task_document_name, task_from_page,
-                                                                                   task_to_page, len(chunks),
-                                                                                   token_count, time_cost))
+            DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, len(chunks), 0)
+
+            time_cost = timer() - start_ts
+            progress_callback(prog=1.0, msg="Done ({:.2f}s)".format(time_cost))
+            logging.info(
+                "Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(task_document_name, task_from_page,
+                                                                                           task_to_page, len(chunks),
+                                                                                           token_count, time_cost))
+
+    finally:
+        # 작업 완료 후 상태 업데이트
+        with mt_lock:
+            CURRENT_TASK = None
 
 
 def handle_task():
@@ -647,34 +556,51 @@ def handle_task():
 def report_status():
     global CONSUMER_NAME, BOOT_AT, PENDING_TASKS, LAG_TASKS, mt_lock, DONE_TASKS, FAILED_TASKS, CURRENT_TASK
     REDIS_CONN.sadd("TASKEXE", CONSUMER_NAME)
+    last_report_time = 0
+    
     while True:
         try:
-            now = datetime.now()
-            group_info = REDIS_CONN.queue_info(SVR_QUEUE_NAME, "rag_flow_svr_task_broker")
-            if group_info is not None:
-                PENDING_TASKS = int(group_info.get("pending", 0))
-                LAG_TASKS = int(group_info.get("lag", 0))
+            now = time.time()
+            # 30초마다만 상태 보고
+            if now - last_report_time < 30:
+                time.sleep(1)
+                continue
+                
+            last_report_time = now
+            now_dt = datetime.now()
+            
+            # Redis 연결 재사용
+            try:
+                group_info = REDIS_CONN.queue_info(SVR_QUEUE_NAME, "rag_flow_svr_task_broker")
+                if group_info is not None:
+                    PENDING_TASKS = int(group_info.get("pending", 0))
+                    LAG_TASKS = int(group_info.get("lag", 0))
 
-            with mt_lock:
-                heartbeat = json.dumps({
-                    "name": CONSUMER_NAME,
-                    "now": now.astimezone().isoformat(timespec="milliseconds"),
-                    "boot_at": BOOT_AT,
-                    "pending": PENDING_TASKS,
-                    "lag": LAG_TASKS,
-                    "done": DONE_TASKS,
-                    "failed": FAILED_TASKS,
-                    "current": CURRENT_TASK,
-                })
-            REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now.timestamp())
-            logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
-
-            expired = REDIS_CONN.zcount(CONSUMER_NAME, 0, now.timestamp() - 60 * 30)
-            if expired > 0:
-                REDIS_CONN.zpopmin(CONSUMER_NAME, expired)
-        except Exception:
+                with mt_lock:
+                    heartbeat = json.dumps({
+                        "name": CONSUMER_NAME,
+                        "now": now_dt.astimezone().isoformat(timespec="milliseconds"),
+                        "boot_at": BOOT_AT,
+                        "pending": PENDING_TASKS,
+                        "lag": LAG_TASKS,
+                        "done": DONE_TASKS,
+                        "failed": FAILED_TASKS,
+                        "current": CURRENT_TASK,
+                    })
+                REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now)
+                
+                # 30분 이상 된 데이터 정리
+                expired = REDIS_CONN.zcount(CONSUMER_NAME, 0, now - 1800)  # 30분
+                if expired > 0:
+                    REDIS_CONN.zpopmin(CONSUMER_NAME, expired)
+                    
+                logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
+            except Exception as e:
+                logging.error(f"Redis operation failed: {e}")
+                
+        except Exception as e:
             logging.exception("report_status got exception")
-        time.sleep(30)
+            time.sleep(5)  # 에러 발생시 좀 더 긴 대기
 
 
 def analyze_heap(snapshot1: tracemalloc.Snapshot, snapshot2: tracemalloc.Snapshot, snapshot_id: int, dump_full: bool):
@@ -694,10 +620,25 @@ def analyze_heap(snapshot1: tracemalloc.Snapshot, snapshot2: tracemalloc.Snapsho
     logging.info(msg)
 
 
-# 메모리 제한 설정 (예: 2GB)
+# 메모리 제한 설정
 def set_memory_limit():
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024 * 1024 * 1024, hard))
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        logging.info(f"Current memory limits - soft: {soft/(1024*1024*1024):.2f}GB, hard: {hard/(1024*1024*1024):.2f}GB")
+        
+        # 2GB 또는 현재 하드 리밋 중 작은 값으로 설정
+        target_limit = min(2 * 1024 * 1024 * 1024, hard)
+        if target_limit < soft:
+            # 현재 소프트 리밋이 더 크면 조정하지 않음
+            logging.warning(f"Current soft limit ({soft/(1024*1024*1024):.2f}GB) is higher than target limit ({target_limit/(1024*1024*1024):.2f}GB). Keeping current limit.")
+            return
+            
+        resource.setrlimit(resource.RLIMIT_AS, (target_limit, hard))
+        logging.info(f"Memory limit set to {target_limit/(1024*1024*1024):.2f}GB")
+    except ValueError as e:
+        logging.warning(f"Failed to set memory limit: {e}. Using system defaults.")
+    except Exception as e:
+        logging.warning(f"Unexpected error while setting memory limit: {e}. Using system defaults.")
 
 
 # LLM 모델 캐싱
@@ -706,7 +647,28 @@ def get_cached_model(tenant_id, model_type, model_name, lang):
     return LLMBundle(tenant_id, model_type, llm_name=model_name, lang=lang)
 
 
+def cleanup_resources():
+    global background_thread
+    logging.info("Cleaning up resources...")
+    if background_thread and background_thread.is_alive():
+        logging.info("Stopping background thread...")
+        background_thread.join(timeout=5)
+    logging.info("Cleanup complete")
+
+
+def signal_handler(signum, frame):
+    logging.info(f"Received signal {signum}")
+    cleanup_resources()
+    sys.exit(0)
+
+
 def main():
+    global background_thread
+    
+    # 시그널 핸들러 등록
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     logging.info(r"""
   ______           __      ______                     __            
  /_  __/___ ______/ /__   / ____/  _____  _______  __/ /_____  _____
@@ -716,60 +678,89 @@ def main():
     """)
     logging.info(f'TaskExecutor: RAGFlow version: {get_ragflow_version()}')
     
-    # 메모리 제한 설정
-    set_memory_limit()
-    
-    # 프로세스 우선순위 설정
-    os.nice(10)
-    
-    settings.init_settings()
-    print_rag_settings()
-    
-    # 메모리 모니터링 시작
-    process = psutil.Process()
-    initial_memory = process.memory_info().rss / 1024 / 1024  # MB
-    logging.info(f"Initial memory usage: {initial_memory:.2f}MB")
-    
-    background_thread = threading.Thread(target=report_status)
-    background_thread.daemon = True
-    background_thread.start()
-
-    TRACE_MALLOC_DELTA = int(os.environ.get('TRACE_MALLOC_DELTA', "0"))
-    TRACE_MALLOC_FULL = int(os.environ.get('TRACE_MALLOC_FULL', "0"))
-    if TRACE_MALLOC_DELTA > 0:
-        if TRACE_MALLOC_FULL < TRACE_MALLOC_DELTA:
-            TRACE_MALLOC_FULL = TRACE_MALLOC_DELTA
-        tracemalloc.start()
-        snapshot1 = tracemalloc.take_snapshot()
+    try:
+        # 메모리 제한 설정
+        set_memory_limit()
         
-    task_count = 0
-    while True:
+        # 프로세스 우선순위 설정
         try:
-            handle_task()
-            task_count += 1
-            
-            # 주기적으로 메모리 사용량 체크 및 로깅
-            if task_count % 10 == 0:  # 10개 태스크마다
-                current_memory = process.memory_info().rss / 1024 / 1024
-                logging.info(f"Current memory usage: {current_memory:.2f}MB")
-                
-                # 메모리 임계치 초과시 경고
-                if current_memory > 1800:  # 1.8GB
-                    logging.warning(f"High memory usage detected: {current_memory:.2f}MB")
-                    gc.collect()  # 가비지 컬렉션 강제 실행
-            
-            num_tasks = DONE_TASKS + FAILED_TASKS
-            if TRACE_MALLOC_DELTA > 0 and num_tasks > 0 and num_tasks % TRACE_MALLOC_DELTA == 0:
-                snapshot2 = tracemalloc.take_snapshot()
-                analyze_heap(snapshot1, snapshot2, int(num_tasks / TRACE_MALLOC_DELTA), 
-                           num_tasks % TRACE_MALLOC_FULL == 0)
-                snapshot1 = snapshot2
-                snapshot2 = None
-                
+            os.nice(10)
         except Exception as e:
-            logging.exception("Error in main loop")
-            time.sleep(1)  # 에러 발생시 잠시 대기
+            logging.warning(f"Failed to set process priority: {e}")
+        
+        settings.init_settings()
+        print_rag_settings()
+        
+        # 메모리 모니터링 시작
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        logging.info(f"Initial memory usage: {initial_memory:.2f}MB")
+        
+        # 기존 스레드가 있다면 정리
+        if background_thread and background_thread.is_alive():
+            background_thread.join(timeout=5)
+        
+        # 새 스레드 시작 (필요한 경우에만)
+        if os.environ.get('ENABLE_STATUS_THREAD', '1') == '1':
+            background_thread = threading.Thread(target=report_status)
+            background_thread.daemon = True
+            try:
+                background_thread.start()
+            except RuntimeError as e:
+                logging.error(f"Failed to start background thread: {e}")
+                logging.warning("Continuing without background thread...")
+        else:
+            logging.info("Status reporting thread disabled by environment variable")
+        
+        TRACE_MALLOC_DELTA = int(os.environ.get('TRACE_MALLOC_DELTA', "0"))
+        TRACE_MALLOC_FULL = int(os.environ.get('TRACE_MALLOC_FULL', "0"))
+        if TRACE_MALLOC_DELTA > 0:
+            if TRACE_MALLOC_FULL < TRACE_MALLOC_DELTA:
+                TRACE_MALLOC_FULL = TRACE_MALLOC_DELTA
+            tracemalloc.start()
+            snapshot1 = tracemalloc.take_snapshot()
+        
+        task_count = 0
+        while True:
+            try:
+                handle_task()
+                task_count += 1
+                
+                # 주기적으로 메모리 사용량 체크 및 로깅
+                if task_count % 10 == 0:  # 10개 태스크마다
+                    current_memory = process.memory_info().rss / 1024 / 1024
+                    logging.info(f"Current memory usage: {current_memory:.2f}MB")
+                    
+                    # 메모리 임계치 초과시 경고
+                    if current_memory > 1800:  # 1.8GB
+                        logging.warning(f"High memory usage detected: {current_memory:.2f}MB")
+                        gc.collect()  # 가비지 컬렉션 강제 실행
+                
+                num_tasks = DONE_TASKS + FAILED_TASKS
+                if TRACE_MALLOC_DELTA > 0 and num_tasks > 0 and num_tasks % TRACE_MALLOC_DELTA == 0:
+                    snapshot2 = tracemalloc.take_snapshot()
+                    analyze_heap(snapshot1, snapshot2, int(num_tasks / TRACE_MALLOC_DELTA), 
+                               num_tasks % TRACE_MALLOC_FULL == 0)
+                    snapshot1 = snapshot2
+                    snapshot2 = None
+                    
+            except Exception as e:
+                logging.exception("Error in main loop")
+                time.sleep(1)  # 에러 발생시 잠시 대기
+                
+    except Exception as e:
+        logging.exception("Fatal error in main")
+        cleanup_resources()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt")
+        cleanup_resources()
+    except Exception as e:
+        logging.exception("Unhandled exception")
+        cleanup_resources()
+        sys.exit(1)
