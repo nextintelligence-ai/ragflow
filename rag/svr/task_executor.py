@@ -285,38 +285,58 @@ def embedding(docs, mdl, parser_config=None, callback=None):
     tk_count = 0
     vector_size = 0
     
-    # 메모리 최적화: 스트리밍 방식으로 처리
-    for doc_batch in batch_generator(docs, batch_size):
-        # 타이틀 임베딩
-        titles = [d.get("docnm_kwd", "Title") for d in doc_batch]
-        title_embeddings, c = mdl.encode(titles)
-        tk_count += c
-        
-        # 컨텐츠 임베딩
-        contents = []
-        for d in doc_batch:
-            c = "\n".join(d.get("question_kwd", []))
-            if not c:
-                c = d["content_with_weight"]
-            c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
-            if not c:
-                c = "None"
-            contents.append(c)
-        
-        content_embeddings, c = mdl.encode(contents)
-        tk_count += c
-        
-        # 가중치 적용 및 벡터 저장
-        title_w = float(parser_config.get("filename_embd_weight", 0.1))
-        for i, doc in enumerate(doc_batch):
-            vec = (title_w * title_embeddings[i] + (1 - title_w) * content_embeddings[i]).tolist()
-            vector_size = len(vec)
-            doc["q_%d_vec" % vector_size] = vec
+    try:
+        # 메모리 최적화: 스트리밍 방식으로 처리
+        for doc_batch in batch_generator(docs, batch_size):
+            # 타이틀 임베딩
+            titles = [d.get("docnm_kwd", "Title") for d in doc_batch]
+            try:
+                title_embeddings, title_tokens = mdl.encode(titles)
+                tk_count += title_tokens if title_tokens else 0
+            except Exception as e:
+                logging.warning(f"타이틀 임베딩 중 오류 발생: {str(e)}")
+                title_embeddings = None
             
-        # 메모리 해제
-        del title_embeddings
-        del content_embeddings
-        gc.collect()
+            # 컨텐츠 임베딩
+            contents = []
+            for d in doc_batch:
+                c = "\n".join(d.get("question_kwd", []))
+                if not c:
+                    c = d["content_with_weight"]
+                c = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", c)
+                if not c:
+                    c = "None"
+                contents.append(c)
+            
+            try:
+                content_embeddings, content_tokens = mdl.encode(contents)
+                tk_count += content_tokens if content_tokens else 0
+            except Exception as e:
+                logging.warning(f"컨텐츠 임베딩 중 오류 발생: {str(e)}")
+                content_embeddings = None
+            
+            # 임베딩이 실패한 경우 건너뛰기
+            if title_embeddings is None or content_embeddings is None:
+                continue
+            
+            # 가중치 적용 및 벡터 저장
+            title_w = float(parser_config.get("filename_embd_weight", 0.1))
+            for i, doc in enumerate(doc_batch):
+                try:
+                    vec = (title_w * title_embeddings[i] + (1 - title_w) * content_embeddings[i]).tolist()
+                    vector_size = len(vec)
+                    doc["q_%d_vec" % vector_size] = vec
+                except Exception as e:
+                    logging.warning(f"벡터 결합 중 오류 발생: {str(e)}")
+                    continue
+            
+            # 메모리 해제
+            del title_embeddings
+            del content_embeddings
+            gc.collect()
+    except Exception as e:
+        logging.error(f"임베딩 처리 중 오류 발생: {str(e)}")
+        raise
         
     return tk_count, vector_size
 
