@@ -16,7 +16,7 @@
 import os
 import os.path
 import logging
-from logging.handlers import RotatingFileHandler
+import logging.handlers
 
 def get_project_base_directory():
     PROJECT_BASE = os.path.abspath(
@@ -28,23 +28,41 @@ def get_project_base_directory():
     )
     return PROJECT_BASE
 
-def initRootLogger(logfile_basename: str, log_format: str = "%(asctime)-15s %(levelname)-8s %(process)d %(message)s"):
-    logger = logging.getLogger()
-    if logger.hasHandlers():
-        return
-
-    log_path = os.path.abspath(os.path.join(get_project_base_directory(), "logs", f"{logfile_basename}.log"))
-
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    formatter = logging.Formatter(log_format)
-
-    handler1 = RotatingFileHandler(log_path, maxBytes=10*1024*1024, backupCount=5)
-    handler1.setFormatter(formatter)
-    logger.addHandler(handler1)
-
-    handler2 = logging.StreamHandler()
-    handler2.setFormatter(formatter)
-    logger.addHandler(handler2)
+def initRootLogger(name):
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+        
+    log_file = os.path.join(log_dir, f"{name}.log")
+    
+    # 로그 로테이션 설정
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    
+    # 로그 포맷 설정
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    file_handler.setFormatter(formatter)
+    
+    # 루트 로거 설정
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # 기존 핸들러 제거
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # 새 핸들러 추가
+    root_logger.addHandler(file_handler)
+    
+    # 콘솔 출력용 핸들러
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
 
     logging.captureWarnings(True)
 
@@ -71,5 +89,5 @@ def initRootLogger(logfile_basename: str, log_format: str = "%(asctime)-15s %(le
         pkg_logger = logging.getLogger(pkg_name)
         pkg_logger.setLevel(pkg_level)
 
-    msg = f"{logfile_basename} log path: {log_path}, log levels: {pkg_levels}"
-    logger.info(msg)
+    msg = f"{name} log path: {log_file}, log levels: {pkg_levels}"
+    logging.getLogger().info(msg)

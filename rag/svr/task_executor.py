@@ -189,8 +189,180 @@ def collect():
     return task
 
 
+class StreamingBuffer:
+    """진정한 스트리밍 방식으로 파일을 처리하는 버퍼 클래스"""
+    
+    def __init__(self, bucket, name, chunk_size=1024*1024):
+        self.bucket = bucket
+        self.name = name
+        self.chunk_size = chunk_size
+        self._buffer = BytesIO()
+        self._position = 0
+        self._file_size = None
+        self._eof = False
+        self._init_file_size()
+        self._load_chunk()
+        self._all_data = None  # 전체 데이터를 저장할 변수
+    
+    def _init_file_size(self):
+        """파일 크기를 초기화합니다."""
+        try:
+            # 먼저 get_size 메서드 존재 여부 확인
+            if hasattr(STORAGE_IMPL, 'get_size'):
+                self._file_size = STORAGE_IMPL.get_size(self.bucket, self.name)
+                return
+                
+            # get_size가 없는 경우 stat 또는 head 메서드 시도
+            if hasattr(STORAGE_IMPL, 'stat'):
+                stat = STORAGE_IMPL.stat(self.bucket, self.name)
+                if hasattr(stat, 'size'):
+                    self._file_size = stat.size
+                    return
+                    
+            if hasattr(STORAGE_IMPL, 'head'):
+                head = STORAGE_IMPL.head(self.bucket, self.name)
+                if hasattr(head, 'content_length'):
+                    self._file_size = head.content_length
+                    return
+                    
+            # 위 방법들이 모두 실패하면 전체 파일을 한 번 읽어서 크기 확인
+            logging.warning("File size detection methods not available, calculating size manually")
+            temp_data = STORAGE_IMPL.get(self.bucket, self.name)
+            if isinstance(temp_data, bytes):
+                self._file_size = len(temp_data)
+            elif isinstance(temp_data, BytesIO):
+                temp_data.seek(0, 2)  # 끝으로 이동
+                self._file_size = temp_data.tell()
+            else:
+                self._file_size = 0
+                logging.error(f"Unexpected data type: {type(temp_data)}")
+                
+        except Exception as e:
+            logging.error(f"Error getting file size: {str(e)}")
+            self._file_size = 0
+    
+    def _load_chunk(self):
+        """청크 단위로 파일을 로드합니다."""
+        try:
+            if self._eof or (self._file_size is not None and self._position >= self._file_size):
+                return False
+                
+            try:
+                # offset과 length 파라미터 지원 확인
+                chunk = STORAGE_IMPL.get(self.bucket, self.name, 
+                                       offset=self._position, 
+                                       length=self.chunk_size)
+            except TypeError:
+                # offset과 length를 지원하지 않는 경우
+                if self._position == 0:
+                    chunk = STORAGE_IMPL.get(self.bucket, self.name)
+                else:
+                    return False
+                
+            if not chunk:
+                self._eof = True
+                return False
+                
+            if isinstance(chunk, bytes):
+                self._buffer = BytesIO(chunk)
+            elif isinstance(chunk, BytesIO):
+                self._buffer = chunk
+            else:
+                raise TypeError(f"Unexpected chunk type: {type(chunk)}")
+                
+            self._position += self.chunk_size
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error loading chunk: {str(e)}")
+            self._eof = True
+            return False
+    
+    def read(self, size=None):
+        """스트리밍 방식으로 데이터를 읽습니다."""
+        if size is None:
+            # 전체 파일을 읽어야 하는 경우
+            if self._all_data is None:
+                all_data = BytesIO()
+                while True:
+                    chunk = self._buffer.read()
+                    if chunk:
+                        all_data.write(chunk)
+                    if not self._load_chunk():
+                        break
+                self._all_data = all_data.getvalue()
+            return self._all_data
+            
+        data = self._buffer.read(size)
+        if not data and not self._eof and self._load_chunk():
+            data = self._buffer.read(size)
+        return data
+    
+    def seek(self, offset, whence=0):
+        """파일 포인터를 이동합니다."""
+        if whence == 0:
+            self._position = offset
+        elif whence == 1:
+            self._position += offset
+        elif whence == 2:
+            if self._file_size is not None:
+                self._position = self._file_size + offset
+            else:
+                raise IOError("File size unknown, cannot seek from end")
+        
+        self._eof = False
+        self._load_chunk()
+        return self._position
+    
+    def tell(self):
+        """현재 파일 포인터 위치를 반환합니다."""
+        return self._position + self._buffer.tell()
+    
+    def getvalue(self):
+        """전체 데이터를 bytes로 반환합니다."""
+        return self.read()
+        
+    def get_size(self):
+        """파일 크기를 반환합니다."""
+        return self._file_size if self._file_size is not None else 0
+        
+    # bytes-like 객체 인터페이스 구현
+    def __bytes__(self):
+        """bytes 타입으로 변환"""
+        return self.read()
+
+
 def get_storage_binary(bucket, name):
     return STORAGE_IMPL.get(bucket, name)
+
+
+def get_storage_binary_stream(bucket, name, chunk_size=1024*1024):
+    """스트리밍 방식으로 스토리지에서 파일을 읽습니다.
+    
+    Args:
+        bucket: 버킷 이름
+        name: 파일 이름
+        chunk_size: 청크 크기 (기본값: 1MB)
+        
+    Yields:
+        bytes: 파일의 청크 데이터
+    """
+    try:
+        binary = STORAGE_IMPL.get(bucket, name)
+        if isinstance(binary, bytes):
+            for i in range(0, len(binary), chunk_size):
+                yield binary[i:i + chunk_size]
+        elif isinstance(binary, BytesIO):
+            while True:
+                chunk = binary.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        else:
+            raise TypeError(f"Unexpected binary type: {type(binary)}")
+    except Exception as e:
+        logging.error(f"Error reading file {name} from bucket {bucket}: {str(e)}")
+        raise
 
 
 def build_chunks(task, progress_callback):
@@ -203,18 +375,75 @@ def build_chunks(task, progress_callback):
     try:
         st = timer()
         bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
-        binary = get_storage_binary(bucket, name)
-        if isinstance(binary, bytes):
-            # bytes 타입 유지
-            pass
-        elif isinstance(binary, BytesIO):
-            # BytesIO를 bytes로 변환
-            binary = binary.getvalue()
+        
+        # 메모리 모니터링 시작
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / 1024 / 1024
+        logging.info(f"Initial memory usage before processing: {initial_memory:.2f}MB")
+        
+        # 이메일 파서인 경우 전체 데이터를 한 번에 읽습니다
+        if task["parser_id"].lower() == ParserType.EMAIL.value.lower():
+            binary_data = STORAGE_IMPL.get(bucket, name)
+            if isinstance(binary_data, BytesIO):
+                binary_data = binary_data.getvalue()
         else:
-            # 다른 타입의 경우 에러 발생
-            raise TypeError(f"Unexpected binary type: {type(binary)}")
+            # 다른 파서의 경우 스트리밍 버퍼 사용
+            binary_data = StreamingBuffer(bucket, name, chunk_size=256*1024)  # 256KB 청크
+        
+        logging.info("Starting file processing from minio: {}/{}".format(task["location"], task["name"]))
+        
+        # 기본 문서 정보 설정
+        base_doc = {
+            "doc_id": task["doc_id"],
+            "kb_id": str(task["kb_id"]),
+            "docnm_kwd": task["name"],
+            "title_tks": rag_tokenizer.tokenize(task["name"])
+        }
+        if task["pagerank"]:
+            base_doc[PAGERANK_FLD] = int(task["pagerank"])
+        
+        # 청크 생성 및 처리
+        for chunk in chunker.chunk(task["name"], binary=binary_data, from_page=task["from_page"],
+                            to_page=task["to_page"], lang=task["language"], callback=progress_callback,
+                            kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"]):
+            # 필수 필드 추가 (shallow copy 사용)
+            chunk_doc = dict(base_doc)
+            chunk_doc.update(chunk)
             
-        logging.info("From minio({}) {}/{}".format(timer() - st, task["location"], task["name"]))
+            # id 필드가 없는 경우 생성
+            if "id" not in chunk_doc:
+                chunk_doc["id"] = xxhash.xxh64(
+                    (chunk_doc.get("content_with_weight", "") + str(chunk_doc["doc_id"])).encode("utf-8")
+                ).hexdigest()
+            
+            # 생성 시간 필드 추가
+            now = datetime.now()
+            chunk_doc["create_time"] = now.strftime("%Y-%m-%d %H:%M:%S").strip()
+            chunk_doc["create_timestamp_flt"] = now.timestamp()
+            
+            yield chunk_doc
+            
+            # 주기적으로 메모리 사용량 체크 및 정리
+            current_memory = process.memory_info().rss / 1024 / 1024
+            if current_memory - initial_memory > 500:  # 500MB 이상 증가시
+                logging.warning(f"High memory increase detected: {current_memory-initial_memory:.2f}MB")
+                gc.collect()  # 가비지 컬렉션 강제 실행
+                
+                # 메모리 상태 로깅
+                gc_stats = gc.get_stats()
+                logging.info(f"GC stats after collection: {gc_stats}")
+            
+        processing_time = timer() - st
+        final_memory = process.memory_info().rss / 1024 / 1024
+        memory_increase = final_memory - initial_memory
+        
+        logging.info(
+            "File processing completed ({:.2f}s), Memory usage: {:.2f}MB ({:+.2f}MB) {}/{}".format(
+                processing_time, final_memory, memory_increase,
+                task["location"], task["name"]
+            )
+        )
+            
     except TimeoutError:
         progress_callback(-1, "Internal server error: Fetch file from minio timeout. Could you try it again.")
         logging.exception(
@@ -225,44 +454,6 @@ def build_chunks(task, progress_callback):
             progress_callback(-1, "Can not find file <%s> from minio. Could you try it again?" % task["name"])
         else:
             progress_callback(-1, "Get file from minio: %s" % str(e).replace("'", ""))
-        logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
-        raise
-
-    try:
-        # 기본 문서 정보 설정
-        base_doc = {
-            "doc_id": task["doc_id"],
-            "kb_id": str(task["kb_id"]),
-            "docnm_kwd": task["name"],
-            "title_tks": rag_tokenizer.tokenize(task["name"])
-        }
-        if task["pagerank"]:
-            base_doc[PAGERANK_FLD] = int(task["pagerank"])
-
-        # 메모리 최적화: 제너레이터로 청크 처리
-        for chunk in chunker.chunk(task["name"], binary=binary, from_page=task["from_page"],
-                            to_page=task["to_page"], lang=task["language"], callback=progress_callback,
-                            kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"]):
-            # 필수 필드 추가
-            chunk_doc = copy.deepcopy(base_doc)
-            chunk_doc.update(chunk)
-            
-            # id 필드가 없는 경우 생성
-            if "id" not in chunk_doc:
-                chunk_doc["id"] = xxhash.xxh64((chunk_doc.get("content_with_weight", "") + str(chunk_doc["doc_id"])).encode("utf-8")).hexdigest()
-            
-            # 생성 시간 필드 추가 (공백 제거 및 ISO 형식 사용)
-            now = datetime.now()
-            chunk_doc["create_time"] = now.strftime("%Y-%m-%d %H:%M:%S").strip()
-            chunk_doc["create_timestamp_flt"] = now.timestamp()
-            
-            yield chunk_doc
-            
-        logging.info("Chunking({}) {}/{} done".format(timer() - st, task["location"], task["name"]))
-    except TaskCanceledException:
-        raise
-    except Exception as e:
-        progress_callback(-1, "Internal server error while chunking: %s" % str(e).replace("'", ""))
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
 

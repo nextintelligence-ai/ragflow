@@ -28,6 +28,7 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+import psutil
 
 from werkzeug.serving import run_simple
 from api import settings
@@ -44,10 +45,18 @@ from rag.settings import print_rag_settings
 from flask import jsonify
 
 
+def get_process_memory():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024  # MB 단위로 반환
+
+
 def update_progress():
     while True:
         time.sleep(3)
         try:
+            current_memory = get_process_memory()
+            if current_memory > 1000:  # 1GB 이상일 때 경고
+                logging.warning(f"High memory usage detected: {current_memory:.2f}MB")
             DocumentService.update_progress()
         except Exception:
             logging.exception("update_progress exception")

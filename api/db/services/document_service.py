@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
+from contextlib import contextmanager
 
 from peewee import fn
 
@@ -365,53 +366,58 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def update_progress(cls):
-        docs = cls.get_unfinished_docs()
-        for d in docs:
-            try:
-                tsks = Task.query(doc_id=d["id"], order_by=Task.create_time)
-                if not tsks:
-                    continue
-                msg = []
-                prg = 0
-                finished = True
-                bad = 0
-                e, doc = DocumentService.get_by_id(d["id"])
-                status = doc.run  # TaskStatus.RUNNING.value
-                for t in tsks:
-                    if 0 <= t.progress < 1:
-                        finished = False
-                    prg += t.progress if t.progress >= 0 else 0
-                    if t.progress_msg not in msg:
-                        msg.append(t.progress_msg)
-                    if t.progress == -1:
-                        bad += 1
-                prg /= len(tsks)
-                if finished and bad:
-                    prg = -1
-                    status = TaskStatus.FAIL.value
-                elif finished:
-                    if d["parser_config"].get("raptor", {}).get("use_raptor") and d["progress_msg"].lower().find(
-                            " raptor") < 0:
-                        queue_raptor_tasks(d)
-                        prg = 0.98 * len(tsks) / (len(tsks) + 1)
-                        msg.append("------ RAPTOR -------")
-                    else:
-                        status = TaskStatus.DONE.value
+        try:
+            docs = cls.get_unfinished_docs()
+            for d in docs:
+                try:
+                    tsks = Task.query(doc_id=d["id"], order_by=Task.create_time)
+                    if not tsks:
+                        continue
+                    msg = []
+                    prg = 0
+                    finished = True
+                    bad = 0
+                    e, doc = DocumentService.get_by_id(d["id"])
+                    status = doc.run
+                    for t in tsks:
+                        if 0 <= t.progress < 1:
+                            finished = False
+                        prg += t.progress if t.progress >= 0 else 0
+                        if t.progress_msg not in msg:
+                            msg.append(t.progress_msg)
+                        if t.progress == -1:
+                            bad += 1
+                    prg /= len(tsks)
+                    if finished and bad:
+                        prg = -1
+                        status = TaskStatus.FAIL.value
+                    elif finished:
+                        if d["parser_config"].get("raptor", {}).get("use_raptor") and d["progress_msg"].lower().find(" raptor") < 0:
+                            queue_raptor_tasks(d)
+                            prg = 0.98 * len(tsks) / (len(tsks) + 1)
+                            msg.append("------ RAPTOR -------")
+                        else:
+                            status = TaskStatus.DONE.value
 
-                msg = "\n".join(msg)
-                info = {
-                    "process_duation": datetime.timestamp(
-                        datetime.now()) -
-                                       d["process_begin_at"].timestamp(),
-                    "run": status}
-                if prg != 0:
-                    info["progress"] = prg
-                if msg:
-                    info["progress_msg"] = msg
-                cls.update_by_id(d["id"], info)
-            except Exception as e:
-                if str(e).find("'0'") < 0:
-                    logging.exception("fetch task exception")
+                    msg = "\n".join(msg)
+                    info = {
+                        "process_duation": datetime.timestamp(datetime.now()) - d["process_begin_at"].timestamp(),
+                        "run": status
+                    }
+                    if prg != 0:
+                        info["progress"] = prg
+                    if msg:
+                        info["progress_msg"] = msg
+                    cls.update_by_id(d["id"], info)
+                except Exception as e:
+                    if str(e).find("'0'") < 0:
+                        logging.exception("fetch task exception")
+                finally:
+                    DB.close()
+        except Exception as e:
+            logging.exception("update_progress exception")
+        finally:
+            DB.close()
 
     @classmethod
     @DB.connection_context()
