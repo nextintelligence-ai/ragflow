@@ -26,6 +26,7 @@ import email.utils
 from datetime import datetime
 import nltk
 from nltk.corpus import wordnet
+import json
 
 # NLTK 데이터 초기화
 try:
@@ -46,12 +47,26 @@ except:
 def get_language_specific_delimiters(detected_lang):
     """언어별 적절한 구분자 반환"""
     delimiters = {
-        'ko': '\n!?。；！？.,:，：』」\n\n',  # 한국어
-        'en': '\n!?.,:;}\n\n',  # 영어
-        'ja': '\n!?。；！？.,:，：』」\n\n',  # 일본어
-        'zh': '\n!?。；！？.,:，：』」\n\n',  # 중국어
+        'ko': {
+            'sentence': ['。', '！', '？', '.', '!', '?'],
+            'clause': ['，', '；', ',', ';', '：', ':', '」', '』'],
+            'context': ['그러나', '하지만', '따라서', '그래서', '또한', '그리고'],
+            'quote': ['>', '▶', '▷']
+        },
+        'en': {
+            'sentence': ['.', '!', '?'],
+            'clause': [',', ';', ':'],
+            'context': ['however', 'but', 'therefore', 'thus', 'moreover', 'and'],
+            'quote': ['>', '▶', '▷']
+        },
+        'ja': {
+            'sentence': ['。', '！', '？', '.', '!', '?'],
+            'clause': ['、', '，', '；', ',', ';', '：', ':', '」', '』'],
+            'context': ['しかし', 'だが', 'そのため', 'また', 'そして'],
+            'quote': ['>', '▶', '▷']
+        }
     }
-    return delimiters.get(detected_lang, '\n!?。；！？.,:，：』」\n\n')
+    return delimiters.get(detected_lang, delimiters['en'])
 
 def extract_header_metadata(msg):
     """이메일 헤더 메타데이터 추출"""
@@ -102,65 +117,96 @@ def extract_important_keywords(text, content_type="body"):
         text: 텍스트 내용
         content_type: 컨텐츠 타입 (header, body, quote, attachment)
     """
-    important_words = []
+    important_words = set()  # 중복 방지를 위해 set 사용
+    
+    # 이메일 관련 키워드
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, text)
+    important_words.update(emails)
+    
+    # 날짜/시간 패턴
+    date_patterns = [
+        r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',  # YYYY-MM-DD
+        r'\d{1,2}[-/]\d{1,2}[-/]\d{4}',  # DD-MM-YYYY
+        r'\d{1,2}:\d{2}(?::\d{2})?'      # HH:MM:SS
+    ]
+    for pattern in date_patterns:
+        dates = re.findall(pattern, text)
+        important_words.update(dates)
     
     # 헤더 관련 키워드
     if content_type == "header":
-        header_keywords = ["Subject:", "From:", "To:", "Cc:", "Date:"]
-        words = text.split()
-        header_words = [word.strip(":") for word in words if any(keyword in word for keyword in header_keywords)]
-        important_words.extend(header_words)
+        header_fields = ["Subject:", "From:", "To:", "Cc:", "Bcc:", "Date:"]
+        for field in header_fields:
+            if field in text:
+                value = text.split(field)[1].split('\n')[0].strip()
+                if value:
+                    important_words.add(value)
     
     # 본문 관련 키워드
     if content_type in ["body", "quote"]:
-        # 대문자로 시작하는 단어 (이름, 고유명사 등)
+        # 인사말 패턴
+        greetings = [
+            r'안녕하[세습]요',
+            r'(?:좋은|수고하신|안녕하신) ?\w{2,3} 되[세습]요',
+            r'감사합니다',
+            r'Dear\s+\w+',
+            r'Hello\s+\w+',
+            r'Hi\s+\w+'
+        ]
+        for pattern in greetings:
+            matches = re.findall(pattern, text)
+            important_words.update(matches)
+        
+        # 중요 표시 단어
+        important_markers = [
+            "중요", "긴급", "필독", "요청", "문의", "답변", "회신", "전달", "공지", "안내",
+            "Important", "Urgent", "Action", "Required", "Deadline", "ASAP", "Priority"
+        ]
         words = text.split()
-        capitalized_words = [word for word in words if word and word[0].isupper()]
-        important_words.extend(capitalized_words[:5])  # 상위 5개만 선택
-        
-        # 이메일 주소
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
-        important_words.extend(emails)
-        
-        # 날짜/시간 패턴
-        date_pattern = r'\d{4}[-/]\d{1,2}[-/]\d{1,2}'
-        dates = re.findall(date_pattern, text)
-        important_words.extend(dates)
-        
-        # 중요 표시 단어 ("Important", "Urgent", "Action Required" 등)
-        important_markers = ["Important", "Urgent", "Action", "Required", "Deadline", "ASAP", "Priority"]
         marked_words = [word for word in words if word in important_markers]
-        important_words.extend(marked_words)
+        important_words.update(marked_words)
         
-        # 반복되는 단어 (2회 이상 등장하는 단어는 중요할 수 있음)
-        word_counts = {}
-        for word in words:
-            if len(word) > 3:  # 짧은 단어 제외
-                word_counts[word] = word_counts.get(word, 0) + 1
-        repeated_words = [word for word, count in word_counts.items() if count > 1]
-        important_words.extend(repeated_words[:5])  # 상위 5개만 선택
+        # 조직/부서명 패턴
+        org_patterns = [
+            r'\w+[팀부과처청국실]',
+            r'[A-Za-z\s]+\s+Team',
+            r'[A-Za-z\s]+\s+Department',
+            r'[A-Za-z\s]+\s+Division'
+        ]
+        for pattern in org_patterns:
+            orgs = re.findall(pattern, text)
+            important_words.update(orgs)
+        
+        # 연락처 패턴
+        contact_patterns = [
+            r'(?:전화|연락처|Tel|TEL|Phone)[\s:]+\d[\d\s-]+\d',
+            r'\d{2,4}[-\s]?\d{3,4}[-\s]?\d{4}'
+        ]
+        for pattern in contact_patterns:
+            contacts = re.findall(pattern, text)
+            important_words.update(contacts)
     
     # 첨부파일 관련 키워드
     elif content_type == "attachment":
         # 파일 확장자
         ext_pattern = r'\.[A-Za-z0-9]+$'
         extensions = re.findall(ext_pattern, text)
-        important_words.extend(extensions)
+        important_words.update(extensions)
         
         # 파일명에서 의미있는 단어 추출
         words = re.split(r'[_\-\s.]', text)
         meaningful_words = [word for word in words if len(word) > 2]
-        important_words.extend(meaningful_words)
+        important_words.update(meaningful_words)
     
-    # 중복 제거 및 정리
-    important_words = list(set(important_words))
     # 특수문자 제거 및 공백 정리
-    important_words = [re.sub(r'[^\w\s@.-]', '', word).strip() for word in important_words]
-    # 빈 문자열 제거
-    important_words = [word for word in important_words if word]
+    cleaned_words = set()
+    for word in important_words:
+        cleaned = re.sub(r'[^\w\s@.-]', '', word).strip()
+        if cleaned and len(cleaned) > 1:  # 빈 문자열과 한 글자 단어 제외
+            cleaned_words.add(cleaned)
     
-    return important_words
+    return list(cleaned_words)  # set을 list로 변환하여 반환
 
 def add_tokenized_fields(chunk_doc, text, content_type="body"):
     """각 청크에 토큰화된 필드 추가"""
@@ -183,13 +229,16 @@ def add_tokenized_fields(chunk_doc, text, content_type="body"):
         # 검색 가능성을 높이기 위한 추가 필드
         chunk_doc["content_with_weight"] = text
         chunk_doc["text"] = text
-        chunk_doc["searchable_text"] = f"{text} {chunk_doc['content_ltks']} {chunk_doc['content_sm_tks']}"  # 검색 가능한 모든 텍스트 결합
         
-        # 중요 키워드 추출 및 검색 가능성 향상
-        keywords = extract_important_keywords(text, content_type)
-        chunk_doc["important_kwd"] = keywords
-        if keywords:
-            chunk_doc["searchable_text"] += f" {' '.join(keywords)}"
+        # 검색 가능한 모든 텍스트 결합
+        searchable_parts = [
+            text,
+            chunk_doc['content_ltks'],
+            chunk_doc['content_sm_tks']
+        ]
+        
+        chunk_doc["searchable_text"] = ' '.join(searchable_parts)
+        chunk_doc["searchable_text_length"] = len(chunk_doc["searchable_text"])
         
     except Exception as e:
         logging.warning(f"토큰화 중 오류 발생: {str(e)}")
@@ -199,7 +248,246 @@ def add_tokenized_fields(chunk_doc, text, content_type="body"):
         chunk_doc["content_with_weight"] = text
         chunk_doc["text"] = text
         chunk_doc["searchable_text"] = text
-        chunk_doc["important_kwd"] = []
+        chunk_doc["searchable_text_length"] = len(text)
+
+def split_into_sentences(text, lang="auto"):
+    """텍스트를 문장 단위로 분리"""
+    if lang == "auto":
+        try:
+            lang = detect(text)
+        except:
+            lang = "en"
+    
+    delimiters = get_language_specific_delimiters(lang)
+    
+    # 줄바꿈으로 먼저 분리
+    paragraphs = text.split('\n')
+    sentences = []
+    
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            continue
+            
+        # 인용문 체크
+        is_quote = any(paragraph.strip().startswith(q) for q in delimiters['quote'])
+        
+        # 현재 문장 버퍼
+        current_sentence = ""
+        
+        for char in paragraph:
+            current_sentence += char
+            
+            # 문장 종결 확인
+            is_end = False
+            for end in delimiters['sentence']:
+                if current_sentence.strip().endswith(end):
+                    is_end = True
+                    break
+            
+            # 문장이 완성되면 추가
+            if is_end:
+                if current_sentence.strip():
+                    sentences.append({
+                        'text': current_sentence.strip(),
+                        'is_quote': is_quote
+                    })
+                current_sentence = ""
+        
+        # 남은 문장 처리
+        if current_sentence.strip():
+            sentences.append({
+                'text': current_sentence.strip(),
+                'is_quote': is_quote
+            })
+    
+    return sentences
+
+def group_sentences(sentences, max_chunk_size=1024):
+    """문장들을 적절한 크기의 청크로 그룹화"""
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for sentence in sentences:
+        # 문장 토큰 수 계산
+        sentence_tokens = len(rag_tokenizer.tokenize(sentence['text']))
+        
+        # 단일 문장이 최대 크기를 초과하는 경우
+        if sentence_tokens > max_chunk_size:
+            # 기존 청크가 있다면 저장
+            if current_chunk:
+                chunks.append('\n'.join([s['text'] for s in current_chunk]))
+                current_chunk = []
+                current_size = 0
+            
+            # 긴 문장을 적절히 분할
+            words = sentence['text'].split()
+            temp_sentence = []
+            temp_size = 0
+            
+            for word in words:
+                word_tokens = len(rag_tokenizer.tokenize(word))
+                if temp_size + word_tokens > max_chunk_size and temp_sentence:
+                    chunks.append(' '.join(temp_sentence))
+                    temp_sentence = [word]
+                    temp_size = word_tokens
+                else:
+                    temp_sentence.append(word)
+                    temp_size += word_tokens
+            
+            if temp_sentence:
+                chunks.append(' '.join(temp_sentence))
+            continue
+        
+        # 현재 청크에 문장을 추가했을 때 최대 크기를 초과하는 경우
+        if current_size + sentence_tokens > max_chunk_size:
+            if current_chunk:
+                chunks.append('\n'.join([s['text'] for s in current_chunk]))
+            current_chunk = [sentence]
+            current_size = sentence_tokens
+        else:
+            # 인용문이 시작되거나 끝날 때 새로운 청크 시작
+            if current_chunk and current_chunk[-1]['is_quote'] != sentence['is_quote']:
+                chunks.append('\n'.join([s['text'] for s in current_chunk]))
+                current_chunk = []
+                current_size = 0
+            
+            current_chunk.append(sentence)
+            current_size += sentence_tokens
+    
+    # 마지막 청크 처리
+    if current_chunk:
+        chunks.append('\n'.join([s['text'] for s in current_chunk]))
+    
+    return chunks
+
+def smart_email_chunking(text, lang="auto", max_chunk_size=1024):
+    """스마트 이메일 청킹 - 문장 단위 처리
+    - 문장 단위로 분리
+    - 문맥을 고려한 그룹화
+    - 인용문 구분
+    - 언어별 최적화
+    """
+    # 문장 단위로 분리
+    sentences = split_into_sentences(text, lang)
+    
+    # 빈 문장 제거
+    sentences = [s for s in sentences if s['text'].strip()]
+    
+    # 문장 그룹화하여 청크 생성
+    chunks = group_sentences(sentences, max_chunk_size)
+    
+    # 빈 청크 제거
+    chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+    
+    return chunks
+
+def extract_email_metadata(msg):
+    """향상된 이메일 메타데이터 추출"""
+    metadata = {
+        'headers': {},
+        'thread_info': {},
+        'importance': 0,
+        'participants': set(),
+        'references': set(),
+    }
+    
+    # 기본 헤더 처리
+    important_headers = [
+        'From', 'To', 'Cc', 'Bcc', 'Subject', 'Date',
+        'Message-ID', 'In-Reply-To', 'References',
+        'Thread-Index', 'Thread-Topic', 'Importance',
+        'X-Priority', 'X-MSMail-Priority'
+    ]
+    
+    for header in important_headers:
+        value = msg.get(header)
+        if value:
+            if header == 'Date':
+                try:
+                    date_tuple = email.utils.parsedate_tz(value)
+                    if date_tuple:
+                        dt = datetime.fromtimestamp(email.utils.mktime_tz(date_tuple))
+                        metadata['headers'][header] = dt.strftime('%Y-%m-%d %H:%M:%S %z')
+                        continue
+                except Exception:
+                    pass
+            metadata['headers'][header] = value
+    
+    # 참여자 추출
+    for header in ['From', 'To', 'Cc', 'Bcc']:
+        if header in metadata['headers']:
+            addresses = email.utils.getaddresses([metadata['headers'][header]])
+            for name, addr in addresses:
+                if addr:
+                    metadata['participants'].add(addr.lower())
+    
+    # 스레드 정보 처리
+    if 'References' in metadata['headers']:
+        refs = metadata['headers']['References'].split()
+        metadata['references'].update(refs)
+        metadata['thread_info']['depth'] = len(refs)
+    else:
+        metadata['thread_info']['depth'] = 0
+    
+    # 중요도 계산
+    importance_indicators = {
+        'X-Priority': {'1': 2, '2': 1},
+        'X-MSMail-Priority': {'High': 2, 'Normal': 1, 'Low': 0},
+        'Importance': {'high': 2, 'normal': 1, 'low': 0}
+    }
+    
+    for header, values in importance_indicators.items():
+        if header in metadata['headers']:
+            value = metadata['headers'][header].lower()
+            if value in values:
+                metadata['importance'] = max(metadata['importance'], values[value])
+    
+    # 집합을 리스트로 변환
+    metadata['participants'] = list(metadata['participants'])
+    metadata['references'] = list(metadata['references'])
+    
+    return metadata
+
+def process_email_content(msg):
+    """이메일 컨텐츠 고급 처리"""
+    content_parts = {
+        'text': [],
+        'html': [],
+        'attachments': [],
+        'quotes': []
+    }
+    
+    def process_part(part):
+        """파트 처리"""
+        content_type = part.get_content_type()
+        
+        if content_type == 'text/plain':
+            text = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+            content_parts['text'].append(text)
+            
+        elif content_type == 'text/html':
+            html = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+            main_text, quotes = process_html_content(html)
+            content_parts['html'].append(main_text)
+            content_parts['quotes'].extend(quotes)
+            
+        elif part.get_filename():  # 첨부파일
+            content_parts['attachments'].append({
+                'filename': part.get_filename(),
+                'content_type': content_type,
+                'size': len(part.get_payload(decode=True))
+            })
+    
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            process_part(part)
+    else:
+        process_part(msg)
+    
+    return content_parts
 
 def chunk(
     filename,
@@ -208,145 +496,129 @@ def chunk(
     to_page=100000,
     lang="auto",
     callback=None,
-    **kwargs,
+    max_chunk_size=1024,  # 이메일의 경우 더 큰 청크 크기 사용
+    **kwargs
 ):
     """
-    EML 파일 처리를 위한 고급 chunking
+    개선된 이메일 청킹 프로세스
     - 구조적 특성 (헤더, 본문, 인용문, 첨부파일) 고려
     - 언어 자동 감지 및 언어별 최적화
-    - HTML/텍스트 컨텐츠 정제
-    - 검색 가능성 향상을 위한 필드 추가
+    - 문맥 기반 청킹
+    - 메타데이터 강화
     """
-    parser_config = kwargs.get(
-        "parser_config",
-        {"chunk_token_num": 256, "layout_recognize": True},
-    )
-    
-    doc = {
-        "docnm_kwd": filename,
-        "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename)),
-    }
-    doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
-    
-    # 공통 필드 추가
-    current_time = datetime.now()
-    doc["create_time"] = str(current_time).replace("T", " ")[:19]
-    doc["create_timestamp_flt"] = current_time.timestamp()
-    doc["img_id"] = ""
-    doc["question_tks"] = ""  # 이메일은 Q&A가 아니므로 빈 문자열
-    doc["important_kwd"] = []  # 기본 빈 리스트로 초기화
-
-    main_res = []
-    attachment_res = []
+    if callback is None:
+        callback = lambda prog=None, msg="": None
 
     if binary:
         msg = BytesParser(policy=policy.default).parse(io.BytesIO(binary))
     else:
         msg = BytesParser(policy=policy.default).parse(open(filename, "rb"))
 
-    # 1. 헤더 정보 처리
-    header_chunk = extract_header_metadata(msg)
-    header_doc = doc.copy()
-    header_doc["content_type"] = "header"
-    add_tokenized_fields(header_doc, header_chunk, "header")
-    main_res.append(header_doc)
-
-    text_contents = []
-    html_contents = []
-    quotes = []
-
-    # 2. 이메일 본문 처리
-    def _add_content(msg, content_type):
-        if content_type == "text/plain":
-            try:
-                charset = msg.get_content_charset() or 'utf-8'
-                payload = msg.get_payload(decode=True)
-                text = payload.decode(charset, errors='replace')
-                text_contents.append(text)
-            except Exception as e:
-                logging.warning(f"텍스트 디코딩 실패: {e}")
-        elif content_type == "text/html":
-            try:
-                charset = msg.get_content_charset() or 'utf-8'
-                payload = msg.get_payload(decode=True)
-                html = payload.decode(charset, errors='replace')
-                main_text, quote_parts = process_html_content(html)
-                html_contents.append(main_text)
-                quotes.extend(quote_parts)
-            except Exception as e:
-                logging.warning(f"HTML 디코딩 실패: {e}")
-        elif "multipart" in content_type:
-            if msg.is_multipart():
-                for part in msg.iter_parts():
-                    _add_content(part, part.get_content_type())
-
-    _add_content(msg, msg.get_content_type())
-
-    # 3. 언어 감지 및 chunk 생성
-    all_text = "\n".join(text_contents + html_contents)
-    try:
-        detected_lang = detect(all_text[:1000]) if lang == "auto" else lang.lower()
-    except:
-        detected_lang = 'en'
+    # 1. 메타데이터 추출
+    metadata = extract_email_metadata(msg)
     
-    eng = detected_lang == "en"
-    delimiters = get_language_specific_delimiters(detected_lang)
+    # 기본 doc 구조 생성
+    subject = metadata['headers'].get('Subject', '')
+    doc = {
+        "docnm_kwd": filename,
+        "title_tks": rag_tokenizer.tokenize(subject) if subject else "",
+        "title_sm_tks": rag_tokenizer.fine_grained_tokenize(rag_tokenizer.tokenize(subject)) if subject else "",
+        "create_time": metadata['headers'].get('Date', str(datetime.now()).replace("T", " ")[:19]),
+        "create_timestamp_flt": datetime.now().timestamp(),
+        "participants": metadata['participants'],
+        "thread_depth": metadata['thread_info']['depth'],
+        "importance": metadata['importance']
+    }
     
-    # 4. 본문 chunking
-    if all_text.strip():
-        sections = [(text, "") for text in all_text.split("\n") if text.strip()]
-        chunks = naive_merge(
-            sections,
-            int(parser_config.get("chunk_token_num", 256)),
-            delimiters
-        )
-        for chunk in chunks:
-            if chunk.strip():
-                content_doc = doc.copy()
-                content_doc["content_type"] = "body"
-                # 본문 내용에 제목 정보 추가하여 검색 가능성 향상
-                if "Subject" in header_chunk:
-                    subject = header_chunk.split('Subject:')[1].split('\n')[0].strip()
-                    chunk = subject + "\n\n" + chunk
-                add_tokenized_fields(content_doc, chunk, "body")
-                main_res.append(content_doc)
-
-    # 5. 인용문 처리
-    for quote in quotes:
-        if quote.strip():
-            quote_doc = doc.copy()
-            quote_doc["content_type"] = "quote"
-            add_tokenized_fields(quote_doc, quote, "quote")
-            main_res.append(quote_doc)
-
-    # 6. 첨부파일 처리
-    for part in msg.iter_attachments():
-        content_disposition = part.get("Content-Disposition")
-        if content_disposition:
-            dispositions = content_disposition.strip().split(";")
-            if dispositions[0].lower() == "attachment":
-                filename = part.get_filename()
-                if filename:
-                    attachment_doc = doc.copy()
-                    attachment_doc["content_type"] = "attachment"
-                    attachment_doc["attachment_name"] = filename
-                    attachment_text = f"Attachment: {filename}"
-                    add_tokenized_fields(attachment_doc, attachment_text, "attachment")
-                    main_res.append(attachment_doc)
-                
-                payload = part.get_payload(decode=True)
-                try:
-                    attachment_chunks = naive_chunk(filename, payload, callback=callback, **kwargs)
-                    # 첨부파일 청크에도 필요한 필드 추가
-                    for chunk in attachment_chunks:
-                        if "text" in chunk:
-                            if "content_ltks" not in chunk:
-                                add_tokenized_fields(chunk, chunk["text"], "attachment")
-                    attachment_res.extend(attachment_chunks)
-                except Exception as e:
-                    logging.warning(f"첨부파일 처리 실패: {filename}, {str(e)}")
-
-    return main_res + attachment_res
+    # 2. 컨텐츠 처리
+    content = process_email_content(msg)
+    
+    chunks = []
+    
+    # 3. 헤더 청크 생성
+    header_text = "\n".join(f"{k}: {v}" for k, v in metadata['headers'].items())
+    header_chunk = doc.copy()
+    header_chunk.update({
+        "content_type": "header",
+        "content": header_text,
+        "chunk_type": "header"
+    })
+    chunks.append(header_chunk)
+    
+    # 4. 본문 청크 생성
+    if content['text'] or content['html']:
+        main_text = "\n".join(content['text']) if content['text'] else "\n".join(content['html'])
+        text_chunks = smart_email_chunking(main_text, lang, max_chunk_size)
+        
+        for i, chunk_text in enumerate(text_chunks):
+            chunk_doc = doc.copy()
+            chunk_doc.update({
+                "content_type": "body",
+                "content": chunk_text,
+                "chunk_type": "body",
+                "chunk_index": i,
+                "total_chunks": len(text_chunks)
+            })
+            chunks.append(chunk_doc)
+    
+    # 5. 인용문 청크 생성
+    if content['quotes']:
+        for i, quote in enumerate(content['quotes']):
+            quote_chunks = smart_email_chunking(quote, lang, max_chunk_size)
+            for j, chunk_text in enumerate(quote_chunks):
+                chunk_doc = doc.copy()
+                chunk_doc.update({
+                    "content_type": "quote",
+                    "content": chunk_text,
+                    "chunk_type": "quote",
+                    "quote_index": i,
+                    "chunk_index": j,
+                    "total_chunks": len(quote_chunks)
+                })
+                chunks.append(chunk_doc)
+    
+    # 6. 첨부파일 메타데이터
+    if content['attachments']:
+        attach_chunk = doc.copy()
+        attach_chunk.update({
+            "content_type": "attachment_metadata",
+            "content": json.dumps(content['attachments'], ensure_ascii=False),
+            "chunk_type": "attachment_metadata"
+        })
+        chunks.append(attach_chunk)
+    
+    # 7. 각 청크에 토큰화 필드 추가
+    for chunk in chunks:
+        add_tokenized_fields(chunk, chunk['content'], chunk['content_type'])
+    
+    # ES 문서 구조 로깅
+    for i, chunk in enumerate(chunks):
+        try:
+            log_chunk = {
+                'chunk_index': i,
+                'content_type': chunk['content_type'],
+                'chunk_type': chunk['chunk_type'],
+                'content_length': len(chunk.get('content', '')),
+                'content_preview': chunk.get('content', '')[:100] + '...' if len(chunk.get('content', '')) > 100 else chunk.get('content', ''),
+                'tokenized_fields': {
+                    'content_ltks': chunk.get('content_ltks', '')[:100] + '...' if len(chunk.get('content_ltks', '')) > 100 else chunk.get('content_ltks', ''),
+                    'content_sm_tks': chunk.get('content_sm_tks', '')[:100] + '...' if len(chunk.get('content_sm_tks', '')) > 100 else chunk.get('content_sm_tks', ''),
+                    'searchable_text_length': len(chunk.get('searchable_text', '')),
+                },
+                'metadata': {
+                    'title_tks': chunk.get('title_tks', ''),
+                    'title_sm_tks': chunk.get('title_sm_tks', ''),
+                    'participants': chunk.get('participants', []),
+                    'thread_depth': chunk.get('thread_depth', 0),
+                    'importance': chunk.get('importance', 0)
+                }
+            }
+            logging.info(f"ES 문서 구조 (청크 {i}):\n{json.dumps(log_chunk, ensure_ascii=False, indent=2)}")
+        except Exception as e:
+            logging.warning(f"문서 구조 로깅 중 오류 발생: {str(e)}")
+    
+    callback(100, "이메일 청킹 완료")
+    return chunks
 
 if __name__ == "__main__":
     import sys
