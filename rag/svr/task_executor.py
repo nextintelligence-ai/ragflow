@@ -205,8 +205,15 @@ def build_chunks(task, progress_callback):
         bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
         binary = get_storage_binary(bucket, name)
         if isinstance(binary, bytes):
-            # 메모리 최적화: 모든 바이너리 데이터를 스트림으로 처리
-            binary = BytesIO(binary)
+            # bytes 타입 유지
+            pass
+        elif isinstance(binary, BytesIO):
+            # BytesIO를 bytes로 변환
+            binary = binary.getvalue()
+        else:
+            # 다른 타입의 경우 에러 발생
+            raise TypeError(f"Unexpected binary type: {type(binary)}")
+            
         logging.info("From minio({}) {}/{}".format(timer() - st, task["location"], task["name"]))
     except TimeoutError:
         progress_callback(-1, "Internal server error: Fetch file from minio timeout. Could you try it again.")
