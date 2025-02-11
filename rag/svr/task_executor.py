@@ -431,6 +431,10 @@ def do_handle_task(task):
         task_document_name = task["name"]
         task_parser_config = task["parser_config"]
 
+        # 토큰 카운트 초기화
+        token_count = 0
+        vector_size = 0
+
         # prepare the progress callback function
         progress_callback = partial(set_progress, task_id, task_from_page, task_to_page)
 
@@ -500,6 +504,16 @@ def do_handle_task(task):
             progress_callback(msg="문서 구조 로깅 중...")
             for i in range(0, len(chunks), 10):  # 10개씩 나눠서 로깅
                 log_document_structure(chunks[i:i+10])
+            
+            # 임베딩 처리
+            try:
+                progress_callback(msg="임베딩 처리 중...")
+                token_count, vector_size = embedding(chunks, embedding_model, task_parser_config, progress_callback)
+            except Exception as e:
+                error_message = f"임베딩 생성 중 오류 발생: {str(e)}"
+                progress_callback(-1, msg=error_message)
+                logging.exception(error_message)
+                raise
             
             # ES 저장 최적화
             es_bulk_size = min(2, max(1, len(chunks) // 200))  # 더 작은 배치 사이즈
