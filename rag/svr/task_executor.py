@@ -251,10 +251,10 @@ def build_chunks(task, progress_callback):
             if "id" not in chunk_doc:
                 chunk_doc["id"] = xxhash.xxh64((chunk_doc.get("content_with_weight", "") + str(chunk_doc["doc_id"])).encode("utf-8")).hexdigest()
             
-            # 생성 시간 필드 추가
-            if "create_time" not in chunk_doc:
-                chunk_doc["create_time"] = str(datetime.now()).replace("T", " ")[:19]
-                chunk_doc["create_timestamp_flt"] = datetime.now().timestamp()
+            # 생성 시간 필드 추가 (공백 제거 및 ISO 형식 사용)
+            now = datetime.now()
+            chunk_doc["create_time"] = now.strftime("%Y-%m-%d %H:%M:%S").strip()
+            chunk_doc["create_timestamp_flt"] = now.timestamp()
             
             yield chunk_doc
             
