@@ -197,6 +197,8 @@ def build_chunks(task, progress_callback):
         st = timer()
         bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
         binary = get_storage_binary(bucket, name)
+        if isinstance(binary, bytes) and len(binary) > 10 * 1024 * 1024:  # 10MB 이상
+            binary = BytesIO(binary)
         logging.info("From minio({}) {}/{}".format(timer() - st, task["location"], task["name"]))
     except TimeoutError:
         progress_callback(-1, "Internal server error: Fetch file from minio timeout. Could you try it again.")
@@ -340,7 +342,12 @@ def init_kb(row, vector_size: int):
 def embedding(docs, mdl, parser_config=None, callback=None):
     if parser_config is None:
         parser_config = {}
-    batch_size = 16
+    batch_size = min(16, max(1, len(docs) // 4))  # 문서 수에 따라 동적으로 조정
+    
+    def batch_generator(items, batch_size):
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
+    
     tts, cnts = [], []
     for d in docs:
         tts.append(d.get("docnm_kwd", "Title"))
@@ -351,30 +358,24 @@ def embedding(docs, mdl, parser_config=None, callback=None):
         if not c:
             c = "None"
         cnts.append(c)
-
+        
     tk_count = 0
     if len(tts) == len(cnts):
-        tts_ = np.array([])
-        for i in range(0, len(tts), batch_size):
-            vts, c = mdl.encode(tts[i: i + batch_size])
-            if len(tts_) == 0:
-                tts_ = vts
-            else:
-                tts_ = np.concatenate((tts_, vts), axis=0)
+        tts_ = []  # 리스트로 변경하여 메모리 효율성 향상
+        for batch in batch_generator(tts, batch_size):
+            vts, c = mdl.encode(batch)
+            tts_.extend(vts)
             tk_count += c
-            callback(prog=0.6 + 0.1 * (i + 1) / len(tts), msg="")
-        tts = tts_
+            callback(prog=0.6 + 0.1 * len(tts_) / len(tts), msg="")
+        tts = np.array(tts_)  # 마지막에 한 번만 numpy 배열로 변환
 
-    cnts_ = np.array([])
-    for i in range(0, len(cnts), batch_size):
-        vts, c = mdl.encode(cnts[i: i + batch_size])
-        if len(cnts_) == 0:
-            cnts_ = vts
-        else:
-            cnts_ = np.concatenate((cnts_, vts), axis=0)
+    cnts_ = []  # 리스트로 변경
+    for batch in batch_generator(cnts, batch_size):
+        vts, c = mdl.encode(batch)
+        cnts_.extend(vts)
         tk_count += c
-        callback(prog=0.7 + 0.2 * (i + 1) / len(cnts), msg="")
-    cnts = cnts_
+        callback(prog=0.7 + 0.2 * len(cnts_) / len(cnts), msg="")
+    cnts = np.array(cnts_)  # 마지막에 한 번만 numpy 배열로 변환
 
     title_w = float(parser_config.get("filename_embd_weight", 0.1))
     vects = (title_w * tts + (1 - title_w) *
@@ -432,6 +433,39 @@ def run_raptor(row, chat_mdl, embd_mdl, callback=None):
     return res, tk_count, vector_size
 
 
+def log_document_structure(chunks):
+    """문서 구조 로깅
+    Args:
+        chunks: 청크 리스트
+    """
+    for i, chunk in enumerate(chunks):
+        try:
+            log_chunk = {
+                'chunk_index': i,
+                'content_type': chunk.get('content_type', 'unknown'),
+                'chunk_type': chunk.get('chunk_type', 'unknown'),
+                'content_length': len(chunk.get('content', '')),
+                'content_preview': chunk.get('content', '')[:100] + '...' if len(chunk.get('content', '')) > 100 else chunk.get('content', ''),
+                'tokenized_fields': {
+                    'content_ltks': chunk.get('content_ltks', '')[:100] + '...' if len(chunk.get('content_ltks', '')) > 100 else chunk.get('content_ltks', ''),
+                    'content_sm_tks': chunk.get('content_sm_tks', '')[:100] + '...' if len(chunk.get('content_sm_tks', '')) > 100 else chunk.get('content_sm_tks', ''),
+                    'searchable_text_length': len(chunk.get('searchable_text', '')),
+                },
+                'metadata': {
+                    'title_tks': chunk.get('title_tks', ''),
+                    'title_sm_tks': chunk.get('title_sm_tks', ''),
+                    'important_kwd': chunk.get('important_kwd', []),
+                    'question_kwd': chunk.get('question_kwd', []),
+                    'participants': chunk.get('participants', []),
+                    'thread_depth': chunk.get('thread_depth', 0),
+                    'importance': chunk.get('importance', 0)
+                }
+            }
+            logging.info(f"ES 문서 구조 (청크 {i}):\n{json.dumps(log_chunk, ensure_ascii=False, indent=2)}")
+        except Exception as e:
+            logging.warning(f"문서 구조 로깅 중 오류 발생: {str(e)}")
+
+
 def do_handle_task(task):
     task_id = task["id"]
     task_from_page = task["from_page"]
@@ -481,6 +515,11 @@ def do_handle_task(task):
 
             # run RAPTOR
             chunks, token_count, vector_size = run_raptor(task, chat_model, embedding_model, progress_callback)
+            
+            # 문서 구조 로깅 추가
+            progress_callback(msg="문서 구조 로깅 중...")
+            log_document_structure(chunks)
+            
         except TaskCanceledException:
             raise
         except Exception as e:
@@ -498,8 +537,11 @@ def do_handle_task(task):
         if not chunks:
             progress_callback(1., msg=f"No chunk built from {task_document_name}")
             return
-        # TODO: exception handler
-        ## set_progress(task["did"], -1, "ERROR: ")
+
+        # 문서 구조 로깅 추가
+        progress_callback(msg="문서 구조 로깅 중...")
+        log_document_structure(chunks)
+
         progress_callback(msg="Generate {} chunks".format(len(chunks)))
         start_ts = timer()
         try:
@@ -519,25 +561,36 @@ def do_handle_task(task):
     chunk_count = len(set([chunk["id"] for chunk in chunks]))
     start_ts = timer()
     doc_store_result = ""
-    es_bulk_size = 4
+    es_bulk_size = min(4, max(1, len(chunks) // 100))  # 청크 수에 따라 동적으로 조정
+    chunk_ids = []
+    
     for b in range(0, len(chunks), es_bulk_size):
-        doc_store_result = settings.docStoreConn.insert(chunks[b:b + es_bulk_size], search.index_name(task_tenant_id),
-                                                        task_dataset_id)
-        if b % 128 == 0:
-            progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
+        current_chunks = chunks[b:b + es_bulk_size]
+        doc_store_result = settings.docStoreConn.insert(current_chunks, search.index_name(task_tenant_id),
+                                                      task_dataset_id)
         if doc_store_result:
             error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
             progress_callback(-1, msg=error_message)
+            # 실패 시 이미 저장된 청크 삭제
+            if chunk_ids:
+                settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
+                                          task_dataset_id)
             raise Exception(error_message)
-        chunk_ids = [chunk["id"] for chunk in chunks[:b + es_bulk_size]]
-        chunk_ids_str = " ".join(chunk_ids)
-        try:
-            TaskService.update_chunk_ids(task["id"], chunk_ids_str)
-        except DoesNotExist:
-            logging.warning(f"do_handle_task update_chunk_ids failed since task {task['id']} is unknown.")
-            doc_store_result = settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
-                                                            task_dataset_id)
-            return
+            
+        chunk_ids.extend([chunk["id"] for chunk in current_chunks])
+        if b % 128 == 0:
+            progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
+            # 중간 저장
+            try:
+                TaskService.update_chunk_ids(task["id"], " ".join(chunk_ids))
+            except DoesNotExist:
+                logging.warning(f"do_handle_task update_chunk_ids failed since task {task['id']} is unknown.")
+                settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id),
+                                          task_dataset_id)
+                return
+            
+        # 메모리 해제
+        del current_chunks
     logging.info("Indexing doc({}), page({}-{}), chunks({}), elapsed: {:.2f}".format(task_document_name, task_from_page,
                                                                                      task_to_page, len(chunks),
                                                                                      timer() - start_ts))
