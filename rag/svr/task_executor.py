@@ -39,6 +39,10 @@ from io import BytesIO
 from multiprocessing.context import TimeoutError
 from timeit import default_timer as timer
 import tracemalloc
+import resource
+import psutil
+from functools import lru_cache
+import gc
 
 import numpy as np
 from peewee import DoesNotExist
@@ -549,7 +553,6 @@ def do_handle_task(task):
         except Exception as e:
             error_message = "Generate embedding error:{}".format(str(e))
             progress_callback(-1, error_message)
-            logging.exception(error_message)
             token_count = 0
             raise
         progress_message = "Embedding chunks ({:.2f}s)".format(timer() - start_ts)
@@ -691,6 +694,18 @@ def analyze_heap(snapshot1: tracemalloc.Snapshot, snapshot2: tracemalloc.Snapsho
     logging.info(msg)
 
 
+# 메모리 제한 설정 (예: 2GB)
+def set_memory_limit():
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024 * 1024 * 1024, hard))
+
+
+# LLM 모델 캐싱
+@lru_cache(maxsize=1)
+def get_cached_model(tenant_id, model_type, model_name, lang):
+    return LLMBundle(tenant_id, model_type, llm_name=model_name, lang=lang)
+
+
 def main():
     logging.info(r"""
   ______           __      ______                     __            
@@ -700,8 +715,21 @@ def main():
 /_/  \__,_/____/_/|_|  /_____/_/|_|\___/\___/\__,_/\__/\____/_/                               
     """)
     logging.info(f'TaskExecutor: RAGFlow version: {get_ragflow_version()}')
+    
+    # 메모리 제한 설정
+    set_memory_limit()
+    
+    # 프로세스 우선순위 설정
+    os.nice(10)
+    
     settings.init_settings()
     print_rag_settings()
+    
+    # 메모리 모니터링 시작
+    process = psutil.Process()
+    initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+    logging.info(f"Initial memory usage: {initial_memory:.2f}MB")
+    
     background_thread = threading.Thread(target=report_status)
     background_thread.daemon = True
     background_thread.start()
@@ -713,14 +741,34 @@ def main():
             TRACE_MALLOC_FULL = TRACE_MALLOC_DELTA
         tracemalloc.start()
         snapshot1 = tracemalloc.take_snapshot()
+        
+    task_count = 0
     while True:
-        handle_task()
-        num_tasks = DONE_TASKS + FAILED_TASKS
-        if TRACE_MALLOC_DELTA > 0 and num_tasks > 0 and num_tasks % TRACE_MALLOC_DELTA == 0:
-            snapshot2 = tracemalloc.take_snapshot()
-            analyze_heap(snapshot1, snapshot2, int(num_tasks / TRACE_MALLOC_DELTA), num_tasks % TRACE_MALLOC_FULL == 0)
-            snapshot1 = snapshot2
-            snapshot2 = None
+        try:
+            handle_task()
+            task_count += 1
+            
+            # 주기적으로 메모리 사용량 체크 및 로깅
+            if task_count % 10 == 0:  # 10개 태스크마다
+                current_memory = process.memory_info().rss / 1024 / 1024
+                logging.info(f"Current memory usage: {current_memory:.2f}MB")
+                
+                # 메모리 임계치 초과시 경고
+                if current_memory > 1800:  # 1.8GB
+                    logging.warning(f"High memory usage detected: {current_memory:.2f}MB")
+                    gc.collect()  # 가비지 컬렉션 강제 실행
+            
+            num_tasks = DONE_TASKS + FAILED_TASKS
+            if TRACE_MALLOC_DELTA > 0 and num_tasks > 0 and num_tasks % TRACE_MALLOC_DELTA == 0:
+                snapshot2 = tracemalloc.take_snapshot()
+                analyze_heap(snapshot1, snapshot2, int(num_tasks / TRACE_MALLOC_DELTA), 
+                           num_tasks % TRACE_MALLOC_FULL == 0)
+                snapshot1 = snapshot2
+                snapshot2 = None
+                
+        except Exception as e:
+            logging.exception("Error in main loop")
+            time.sleep(1)  # 에러 발생시 잠시 대기
 
 
 if __name__ == "__main__":
