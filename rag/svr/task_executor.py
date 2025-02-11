@@ -229,11 +229,35 @@ def build_chunks(task, progress_callback):
         raise
 
     try:
+        # 기본 문서 정보 설정
+        base_doc = {
+            "doc_id": task["doc_id"],
+            "kb_id": str(task["kb_id"]),
+            "docnm_kwd": task["name"],
+            "title_tks": rag_tokenizer.tokenize(task["name"])
+        }
+        if task["pagerank"]:
+            base_doc[PAGERANK_FLD] = int(task["pagerank"])
+
         # 메모리 최적화: 제너레이터로 청크 처리
         for chunk in chunker.chunk(task["name"], binary=binary, from_page=task["from_page"],
                             to_page=task["to_page"], lang=task["language"], callback=progress_callback,
                             kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"]):
-            yield chunk
+            # 필수 필드 추가
+            chunk_doc = copy.deepcopy(base_doc)
+            chunk_doc.update(chunk)
+            
+            # id 필드가 없는 경우 생성
+            if "id" not in chunk_doc:
+                chunk_doc["id"] = xxhash.xxh64((chunk_doc.get("content_with_weight", "") + str(chunk_doc["doc_id"])).encode("utf-8")).hexdigest()
+            
+            # 생성 시간 필드 추가
+            if "create_time" not in chunk_doc:
+                chunk_doc["create_time"] = str(datetime.now()).replace("T", " ")[:19]
+                chunk_doc["create_timestamp_flt"] = datetime.now().timestamp()
+            
+            yield chunk_doc
+            
         logging.info("Chunking({}) {}/{} done".format(timer() - st, task["location"], task["name"]))
     except TaskCanceledException:
         raise
