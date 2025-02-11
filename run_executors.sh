@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# 가상환경 활성화
+source .venv/bin/activate
+
 # 환경 변수 설정
 export PYTHONPATH=${PWD}
 export POETRY_VIRTUALENVS_CREATE=true
