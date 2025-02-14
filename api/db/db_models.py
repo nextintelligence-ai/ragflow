@@ -31,6 +31,10 @@ from peewee import (
     Field, Model, Metadata
 )
 from playhouse.pool import PooledMySQLDatabase, PooledPostgresqlDatabase
+from cryptography.fernet import Fernet
+import base64
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from api.db import SerializedType, ParserType
 from api import settings
@@ -1003,6 +1007,22 @@ class EmailAccount(DataBaseModel):
     created_at = DateTimeField(default=datetime.now)
     updated_at = DateTimeField(default=datetime.now)
 
+    def save(self, *args, **kwargs):
+        if self.password:
+            self.password = encrypt_text(self.password)
+        super().save(*args, **kwargs)
+
+    @property
+    def decrypted_password(self):
+        if self.password:
+            return decrypt_text(self.password)
+        return None
+
+    def to_dict(self):
+        data = super().to_dict()
+        data['decrypted_password'] = self.decrypted_password
+        return data
+
     class Meta:
         db_table = "email_account"
 
@@ -1010,6 +1030,33 @@ class EmailAccount(DataBaseModel):
 def migrate_db():
     with DB.transaction():
         migrator = DatabaseMigrator[settings.DATABASE_TYPE.upper()].value(DB)
+        try:
+            # 기존 EmailAccount의 비밀번호 암호화
+            cursor = DB.execute_sql("SELECT id, password FROM email_account WHERE password IS NOT NULL AND password != ''")
+            rows = cursor.fetchall()
+            for row in rows:
+                try:
+                    # 이미 암호화된 비밀번호인지 확인
+                    try:
+                        decrypt_text(row[1])
+                        # 복호화가 성공하면 이미 암호화된 상태
+                        continue
+                    except Exception:
+                        # 복호화 실패시 아직 암호화되지 않은 상태
+                        pass
+                    
+                    encrypted_password = encrypt_text(row[1])
+                    DB.execute_sql(
+                        "UPDATE email_account SET password = %s WHERE id = %s",
+                        (encrypted_password, row[0])
+                    )
+                    logging.info(f"Encrypted password for email account {row[0]}")
+                except Exception as e:
+                    logging.error(f"Failed to encrypt password for email account {row[0]}: {str(e)}")
+        except Exception as e:
+            logging.error(f"Failed to migrate email account passwords: {str(e)}")
+            pass
+
         try:
             migrate(
                 migrator.add_column('file', 'source_type', CharField(max_length=128, null=False, default="",
@@ -1139,3 +1186,29 @@ def migrate_db():
             )
         except Exception:
             pass
+
+# 암호화 키 생성 및 관리
+def get_encryption_key():
+    if not hasattr(settings, 'ENCRYPTION_KEY'):
+        # PBKDF2를 사용하여 키 생성
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=settings.SECRET_KEY.encode(),
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(settings.SECRET_KEY.encode()))
+        settings.ENCRYPTION_KEY = key
+    return settings.ENCRYPTION_KEY
+
+def encrypt_text(text):
+    if not text:
+        return text
+    f = Fernet(get_encryption_key())
+    return f.encrypt(text.encode()).decode()
+
+def decrypt_text(encrypted_text):
+    if not encrypted_text:
+        return encrypted_text
+    f = Fernet(get_encryption_key())
+    return f.decrypt(encrypted_text.encode()).decode()

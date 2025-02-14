@@ -4,6 +4,7 @@ import sys
 import asyncio
 import logging
 from datetime import datetime
+
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.file_service import FileService
 from api.db.services.file2document_service import File2DocumentService
@@ -145,7 +146,7 @@ async def sync_all_accounts(accounts):
                         **auth_params
                     )
                 else:
-                    auth_params['password'] = account['password']
+                    auth_params['password'] = account['decrypted_password']
                 
                     imap = connect_to_imap(
                         account['imap_host'],

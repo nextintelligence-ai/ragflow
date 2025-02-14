@@ -167,6 +167,9 @@ def sync_status():
 
 def main():
     """메인 함수"""
+    from api import settings
+    settings.init_settings()
+    
     # 데이터베이스 초기화
     from api.db.db_models import init_database_tables
     init_database_tables()

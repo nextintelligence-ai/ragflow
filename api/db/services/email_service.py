@@ -9,9 +9,10 @@ class EmailAccountService(CommonService):
     @DB.connection_context()
     def get_active_accounts(cls):
         """활성화된 모든 이메일 계정 조회"""
-        return list(cls.model.select().where(
+        accounts = cls.model.select().where(
             cls.model.status == "1"
-        ).dicts())
+        )
+        return [account.to_dict() for account in accounts]
 
     @classmethod
     @DB.connection_context()
