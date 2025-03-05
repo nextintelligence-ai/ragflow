@@ -1009,7 +1009,13 @@ class EmailAccount(DataBaseModel):
 
     def save(self, *args, **kwargs):
         if self.password:
-            self.password = encrypt_text(self.password)
+            # 이미 암호화된 비밀번호인지 확인
+            try:
+                decrypt_text(self.password)
+                # 복호화가 성공하면 이미 암호화된 상태이므로 다시 암호화하지 않음
+            except Exception:
+                # 복호화 실패시 아직 암호화되지 않은 상태이므로 암호화 진행
+                self.password = encrypt_text(self.password)
         super().save(*args, **kwargs)
 
     @property
@@ -1045,6 +1051,7 @@ def migrate_db():
                         # 복호화 실패시 아직 암호화되지 않은 상태
                         pass
                     
+                    # 직접 SQL로 업데이트하여 save() 메서드의 암호화를 우회
                     encrypted_password = encrypt_text(row[1])
                     DB.execute_sql(
                         "UPDATE email_account SET password = %s WHERE id = %s",
