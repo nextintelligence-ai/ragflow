@@ -763,7 +763,7 @@ async def process_folder(imap, folder_path, output_dir, concurrent_limit, checkp
                             
                             try:
                                 # 메시지 헤더만 가져오기
-                                _, msg_data = imap.uid('fetch', uid, '(BODY[HEADER.FIELDS (DATE)])')
+                                _, msg_data = imap.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
                                 if msg_data and msg_data[0]:
                                     email_date_str = msg_data[0][1].decode()
                                     # 이메일 날짜 파싱
@@ -1017,9 +1017,9 @@ async def process_email(num, imap, output_dir, folder_path, stats, use_uid=False
         try:
             # FLAGS도 함께 가져오도록 수정
             if use_uid:
-                _, msg_data = current_imap.uid('fetch', num, '(RFC822 FLAGS)')
+                _, msg_data = current_imap.uid('fetch', num, '(RFC822.PEEK FLAGS)')
             else:
-                _, msg_data = current_imap.fetch(num, '(RFC822 FLAGS)')
+                _, msg_data = current_imap.fetch(num, '(RFC822.PEEK FLAGS)')
                 
             if not msg_data or not msg_data[0]:
                 logger.error(f"이메일 데이터 없음: {num}")
